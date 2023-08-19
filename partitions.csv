@@ -1,0 +1,10 @@
+# Name,   Type, SubType, Offset,   Size, Flags
+# Note: if you have increased the bootloader size, make sure to update the offsets to avoid overlap
+ota_0,    app,  ota_0,   ,         0x1E0000,
+ota_1,    app,  ota_1,   ,         0x1E0000,
+nvs,      data, nvs,     ,         0x2000,
+ble_mesh, data, nvs,     ,         0x2000,
+config,     data, nvs,     ,         0x3000,
+otadata,  data, ota,     ,         0x2000,
+phy_init, data, phy,     ,         0x2000,
+mcu_ota,  data, nvs,     ,         0x25000,

@@ -13,11 +13,23 @@
 #include "esp_wpa2.h"
 #include "esp_event.h"
 #include "esp_log.h"
+#include "esp_app_desc.h"
+#include "esp_https_ota.h"
+#include "esp_crc.h"
+#include "esp_ota_ops.h"
 #include "nvs_flash.h"
 #include "ethernet_init.h"
 #include "esp_eth_netif_glue.h"
 #include "esp_smartconfig.h"
 #include "sdkconfig.h"
+
+#include "esp_http_client.h"
+#include "esp_crt_bundle.h"
+#include "esp_tls.h"
+#include "mbedtls/md.h"
+#include "cJSON.h"
+#include "esp_sntp.h"
+#include "mqtt_client.h"
 
 #include "esp_ble_mesh_common_api.h"
 #include "esp_ble_mesh_provisioning_api.h"
@@ -29,6 +41,59 @@
 #include "ble_mesh_example_init.h"
 #include "ble_mesh_example_nvs.h"
 
+#define CONFIG_PARTITION "config"
+
+#define min(x, y) ((x) < (y) ? (x) : (y))
+
+#define DEF_NVS_STR(key) \
+    size_t key##_size = 0; \
+    char *key = NULL
+
+#define LOAD_NVS_STR(handle, key) \
+    DEF_NVS_STR(key); \
+    nvs_get_str(handle, #key, NULL, &key##_size); \
+    assert(key##_size); \
+    assert( key = pvPortMalloc(key##_size + 1) ); \
+    ESP_ERROR_CHECK( nvs_get_str(handle, #key, key, &key##_size) ); \
+    key[key##_size] = 0; \
+    ESP_LOGI(CONFIG_PARTITION, #key ": %s", key)
+
+#define RETRY_LOAD_OPT_NVS_STR(handle, key) \
+    if (nvs_get_str(handle, #key, NULL, &key##_size) == ESP_OK) { \
+        key##_found = 1; \
+        if (key) { \
+            vPortFree(key); \
+        } \
+        assert( key = pvPortMalloc(key##_size + 1) ); \
+        ESP_ERROR_CHECK( nvs_get_str(handle, #key, key, &key##_size) ); \
+        key[key##_size] = 0; \
+        ESP_LOGI(CONFIG_PARTITION, #key ": %s", key); \
+    } \
+    else { \
+        key##_found = 0; \
+        key = NULL; \
+    }
+
+#define LOAD_OPT_NVS_STR(handle, key) \
+    DEF_NVS_STR(key); \
+    int key##_found; \
+    RETRY_LOAD_OPT_NVS_STR(handle, key)
+
+#define RETRY_LOAD_OPT_NVS_U16(handle, key) \
+    if (nvs_get_u16(handle, #key, &key) == ESP_OK) { \
+        key##_found = 1; \
+        ESP_LOGI(CONFIG_PARTITION, #key ": %" PRIu16, key); \
+    } \
+    else { \
+        key##_found = 0; \
+        key = 0; \
+    }
+
+#define LOAD_OPT_NVS_U16(handle, key) \
+    uint16_t key; \
+    int key##_found; \
+    RETRY_LOAD_OPT_NVS_U16(handle, key)
+
 #define CID_ESP 0x02E5
 
 struct esp_eth_netif_glue_t {
@@ -39,6 +104,31 @@ struct esp_eth_netif_glue_t {
     esp_event_handler_instance_t connect_ctx_handler;
     esp_event_handler_instance_t disconnect_ctx_handler;
     esp_event_handler_instance_t get_ip_ctx_handler;
+};
+
+struct mqtt_event_handler_args {
+    char *gateway_ota_topic;
+    char *gateway_ntp_response_topic;
+    char *gateway_ota_download_reply_topic;
+    char *server_cer;
+    char *product_key;
+    char *device_name;
+    esp_mqtt_client_handle_t client;
+    esp_ota_handle_t ota_handle;
+    uint32_t stream_id;
+    uint32_t file_id;
+    int last_progress;
+    const esp_partition_t *ota_partition;
+    SemaphoreHandle_t gateway_ota_upgrading_sem;
+};
+
+struct ota_http_event_handler_args {
+    int last_progress;
+    size_t recv_bytes;
+    size_t total_bytes;
+    const char *product_key;
+    const char *device_name;
+    esp_mqtt_client_handle_t client;
 };
 
 static struct example_info_store {
@@ -55,7 +145,8 @@ static struct example_info_store {
 
 static const char *TCPIP_TAG = "tcp/ip";
 static const char *SC_TAG = "smartconfig";
-static const char *TAG = "ble_mesh";
+static const char *ALIYUN_TAG = "aliyun";
+static const char *BLEMESH_TAG = "ble_mesh";
 
 /* FreeRTOS event group to signal when we are connected & ready to make a request */
 static EventGroupHandle_t s_wifi_event_group;
@@ -285,15 +376,15 @@ static void mesh_example_info_restore(void)
     }
 
     if (exist) {
-        ESP_LOGI(TAG, "Restore, net_idx 0x%04x, app_idx 0x%04x, onoff %u, tid 0x%02x",
+        ESP_LOGI(BLEMESH_TAG, "Restore, net_idx 0x%04x, app_idx 0x%04x, onoff %u, tid 0x%02x",
             store.net_idx, store.app_idx, store.onoff, store.tid);
     }
 }
 
 static void prov_complete(uint16_t net_idx, uint16_t addr, uint8_t flags, uint32_t iv_index)
 {
-    ESP_LOGI(TAG, "net_idx: 0x%04x, addr: 0x%04x", net_idx, addr);
-    ESP_LOGI(TAG, "flags: 0x%02x, iv_index: 0x%08" PRIx32, flags, iv_index);
+    ESP_LOGI(BLEMESH_TAG, "net_idx: 0x%04x, addr: 0x%04x", net_idx, addr);
+    ESP_LOGI(BLEMESH_TAG, "flags: 0x%02x, iv_index: 0x%08" PRIx32, flags, iv_index);
     // board_led_operation(LED_G, LED_OFF);
     store.net_idx = net_idx;
     /* mesh_example_info_store() shall not be invoked here, because if the device
@@ -312,29 +403,29 @@ static void example_ble_mesh_provisioning_cb(esp_ble_mesh_prov_cb_event_t event,
 {
     switch (event) {
     case ESP_BLE_MESH_PROV_REGISTER_COMP_EVT:
-        ESP_LOGI(TAG, "ESP_BLE_MESH_PROV_REGISTER_COMP_EVT, err_code %d", param->prov_register_comp.err_code);
+        ESP_LOGI(BLEMESH_TAG, "ESP_BLE_MESH_PROV_REGISTER_COMP_EVT, err_code %d", param->prov_register_comp.err_code);
         mesh_example_info_restore(); /* Restore proper mesh example info */
         break;
     case ESP_BLE_MESH_NODE_PROV_ENABLE_COMP_EVT:
-        ESP_LOGI(TAG, "ESP_BLE_MESH_NODE_PROV_ENABLE_COMP_EVT, err_code %d", param->node_prov_enable_comp.err_code);
+        ESP_LOGI(BLEMESH_TAG, "ESP_BLE_MESH_NODE_PROV_ENABLE_COMP_EVT, err_code %d", param->node_prov_enable_comp.err_code);
         break;
     case ESP_BLE_MESH_NODE_PROV_LINK_OPEN_EVT:
-        ESP_LOGI(TAG, "ESP_BLE_MESH_NODE_PROV_LINK_OPEN_EVT, bearer %s",
+        ESP_LOGI(BLEMESH_TAG, "ESP_BLE_MESH_NODE_PROV_LINK_OPEN_EVT, bearer %s",
             param->node_prov_link_open.bearer == ESP_BLE_MESH_PROV_ADV ? "PB-ADV" : "PB-GATT");
         break;
     case ESP_BLE_MESH_NODE_PROV_LINK_CLOSE_EVT:
-        ESP_LOGI(TAG, "ESP_BLE_MESH_NODE_PROV_LINK_CLOSE_EVT, bearer %s",
+        ESP_LOGI(BLEMESH_TAG, "ESP_BLE_MESH_NODE_PROV_LINK_CLOSE_EVT, bearer %s",
             param->node_prov_link_close.bearer == ESP_BLE_MESH_PROV_ADV ? "PB-ADV" : "PB-GATT");
         break;
     case ESP_BLE_MESH_NODE_PROV_COMPLETE_EVT:
-        ESP_LOGI(TAG, "ESP_BLE_MESH_NODE_PROV_COMPLETE_EVT");
+        ESP_LOGI(BLEMESH_TAG, "ESP_BLE_MESH_NODE_PROV_COMPLETE_EVT");
         prov_complete(param->node_prov_complete.net_idx, param->node_prov_complete.addr,
             param->node_prov_complete.flags, param->node_prov_complete.iv_index);
         break;
     case ESP_BLE_MESH_NODE_PROV_RESET_EVT:
         break;
     case ESP_BLE_MESH_NODE_SET_UNPROV_DEV_NAME_COMP_EVT:
-        ESP_LOGI(TAG, "ESP_BLE_MESH_NODE_SET_UNPROV_DEV_NAME_COMP_EVT, err_code %d", param->node_set_unprov_dev_name_comp.err_code);
+        ESP_LOGI(BLEMESH_TAG, "ESP_BLE_MESH_NODE_SET_UNPROV_DEV_NAME_COMP_EVT, err_code %d", param->node_set_unprov_dev_name_comp.err_code);
         break;
     default:
         break;
@@ -363,7 +454,7 @@ void example_ble_mesh_send_gen_onoff_set(void)
 
     err = esp_ble_mesh_generic_client_set_state(&common, &set);
     if (err) {
-        ESP_LOGE(TAG, "Send Generic OnOff Set Unack failed");
+        ESP_LOGE(BLEMESH_TAG, "Send Generic OnOff Set Unack failed");
         return;
     }
 
@@ -388,7 +479,7 @@ void example_ble_mesh_send_gen_onoff_get(void)
 
     err = esp_ble_mesh_generic_client_get_state(&common, NULL);
     if (err) {
-        ESP_LOGE(TAG, "Send Generic OnOff Get failed");
+        ESP_LOGE(BLEMESH_TAG, "Send Generic OnOff Get failed");
         return;
     }
 }
@@ -401,30 +492,30 @@ void example_ble_mesh_send_light_hsl_set(void)
 static void example_ble_mesh_generic_client_cb(esp_ble_mesh_generic_client_cb_event_t event,
                                                esp_ble_mesh_generic_client_cb_param_t *param)
 {
-    ESP_LOGI(TAG, "Generic client, event %u, error code %d, opcode is 0x%04" PRIx32,
+    ESP_LOGI(BLEMESH_TAG, "Generic client, event %u, error code %d, opcode is 0x%04" PRIx32,
         event, param->error_code, param->params->opcode);
 
     switch (event) {
     case ESP_BLE_MESH_GENERIC_CLIENT_GET_STATE_EVT:
-        ESP_LOGI(TAG, "ESP_BLE_MESH_GENERIC_CLIENT_GET_STATE_EVT");
+        ESP_LOGI(BLEMESH_TAG, "ESP_BLE_MESH_GENERIC_CLIENT_GET_STATE_EVT");
         if (param->params->opcode == ESP_BLE_MESH_MODEL_OP_GEN_ONOFF_GET) {
-            ESP_LOGI(TAG, "ESP_BLE_MESH_MODEL_OP_GEN_ONOFF_GET, onoff %d", param->status_cb.onoff_status.present_onoff);
+            ESP_LOGI(BLEMESH_TAG, "ESP_BLE_MESH_MODEL_OP_GEN_ONOFF_GET, onoff %d", param->status_cb.onoff_status.present_onoff);
         }
         break;
     case ESP_BLE_MESH_GENERIC_CLIENT_SET_STATE_EVT:
-        ESP_LOGI(TAG, "ESP_BLE_MESH_GENERIC_CLIENT_SET_STATE_EVT");
+        ESP_LOGI(BLEMESH_TAG, "ESP_BLE_MESH_GENERIC_CLIENT_SET_STATE_EVT");
         if (param->params->opcode == ESP_BLE_MESH_MODEL_OP_GEN_ONOFF_GET) {
-            ESP_LOGI(TAG, "ESP_BLE_MESH_MODEL_OP_GEN_ONOFF_GET, onoff %d", param->status_cb.onoff_status.present_onoff);
+            ESP_LOGI(BLEMESH_TAG, "ESP_BLE_MESH_MODEL_OP_GEN_ONOFF_GET, onoff %d", param->status_cb.onoff_status.present_onoff);
         }
         break;
     case ESP_BLE_MESH_GENERIC_CLIENT_PUBLISH_EVT:
-        ESP_LOGI(TAG, "ESP_BLE_MESH_GENERIC_CLIENT_PUBLISH_EVT");
+        ESP_LOGI(BLEMESH_TAG, "ESP_BLE_MESH_GENERIC_CLIENT_PUBLISH_EVT");
         if (param->params->opcode == ESP_BLE_MESH_MODEL_OP_GEN_ONOFF_GET) {
-            ESP_LOGI(TAG, "ESP_BLE_MESH_MODEL_OP_GEN_ONOFF_GET, onoff %d", param->status_cb.onoff_status.present_onoff);
+            ESP_LOGI(BLEMESH_TAG, "ESP_BLE_MESH_MODEL_OP_GEN_ONOFF_GET, onoff %d", param->status_cb.onoff_status.present_onoff);
         }
         break;
     case ESP_BLE_MESH_GENERIC_CLIENT_TIMEOUT_EVT:
-        ESP_LOGE(TAG, "ESP_BLE_MESH_GENERIC_CLIENT_TIMEOUT_EVT");
+        ESP_LOGE(BLEMESH_TAG, "ESP_BLE_MESH_GENERIC_CLIENT_TIMEOUT_EVT");
         if (param->params->opcode == ESP_BLE_MESH_MODEL_OP_GEN_ONOFF_SET) {
             /* If failed to get the response of Generic OnOff Set, resend Generic OnOff Set  */
             // example_ble_mesh_send_gen_onoff_set();
@@ -441,15 +532,15 @@ static void example_ble_mesh_config_server_cb(esp_ble_mesh_cfg_server_cb_event_t
     if (event == ESP_BLE_MESH_CFG_SERVER_STATE_CHANGE_EVT) {
         switch (param->ctx.recv_op) {
         case ESP_BLE_MESH_MODEL_OP_APP_KEY_ADD:
-            ESP_LOGI(TAG, "ESP_BLE_MESH_MODEL_OP_APP_KEY_ADD");
-            ESP_LOGI(TAG, "net_idx 0x%04x, app_idx 0x%04x",
+            ESP_LOGI(BLEMESH_TAG, "ESP_BLE_MESH_MODEL_OP_APP_KEY_ADD");
+            ESP_LOGI(BLEMESH_TAG, "net_idx 0x%04x, app_idx 0x%04x",
                 param->value.state_change.appkey_add.net_idx,
                 param->value.state_change.appkey_add.app_idx);
             ESP_LOG_BUFFER_HEX("AppKey", param->value.state_change.appkey_add.app_key, 16);
             break;
         case ESP_BLE_MESH_MODEL_OP_MODEL_APP_BIND:
-            ESP_LOGI(TAG, "ESP_BLE_MESH_MODEL_OP_MODEL_APP_BIND");
-            ESP_LOGI(TAG, "elem_addr 0x%04x, app_idx 0x%04x, cid 0x%04x, mod_id 0x%04x",
+            ESP_LOGI(BLEMESH_TAG, "ESP_BLE_MESH_MODEL_OP_MODEL_APP_BIND");
+            ESP_LOGI(BLEMESH_TAG, "elem_addr 0x%04x, app_idx 0x%04x, cid 0x%04x, mod_id 0x%04x",
                 param->value.state_change.mod_app_bind.element_addr,
                 param->value.state_change.mod_app_bind.app_idx,
                 param->value.state_change.mod_app_bind.company_id,
@@ -469,24 +560,24 @@ static void example_ble_mesh_config_server_cb(esp_ble_mesh_cfg_server_cb_event_t
 static void example_ble_mesh_light_client_cb(esp_ble_mesh_light_client_cb_event_t event,
                                              esp_ble_mesh_light_client_cb_param_t *param)
 {
-    ESP_LOGI(TAG, "Light client, event %u, error code %d, opcode is 0x%04" PRIx32,
+    ESP_LOGI(BLEMESH_TAG, "Light client, event %u, error code %d, opcode is 0x%04" PRIx32,
         event, param->error_code, param->params->opcode);
 
     switch (event) {
     case ESP_BLE_MESH_LIGHT_CLIENT_GET_STATE_EVT:
-        ESP_LOGI(TAG, "ESP_BLE_MESH_LIGHT_CLIENT_GET_STATE_EVT");
+        ESP_LOGI(BLEMESH_TAG, "ESP_BLE_MESH_LIGHT_CLIENT_GET_STATE_EVT");
         break;
     case ESP_BLE_MESH_LIGHT_CLIENT_SET_STATE_EVT:
-        ESP_LOGI(TAG, "ESP_BLE_MESH_LIGHT_CLIENT_SET_STATE_EVT");
+        ESP_LOGI(BLEMESH_TAG, "ESP_BLE_MESH_LIGHT_CLIENT_SET_STATE_EVT");
         break;
     case ESP_BLE_MESH_LIGHT_CLIENT_PUBLISH_EVT:
-        ESP_LOGI(TAG, "ESP_BLE_MESH_LIGHT_CLIENT_PUBLISH_EVT");
+        ESP_LOGI(BLEMESH_TAG, "ESP_BLE_MESH_LIGHT_CLIENT_PUBLISH_EVT");
         if (param->params->opcode == ESP_BLE_MESH_MODEL_OP_LIGHT_HSL_STATUS) {
-            ESP_LOGI(TAG, "ESP_BLE_MESH_MODEL_OP_LIGHT_HSL_STATUS, hue %0x%04" PRIx16 " saturation %0x%04" PRIx16 " lightness %0x%04" PRIx16, param->status_cb.hsl_status.hsl_hue, param->status_cb.hsl_status.hsl_saturation, param->status_cb.hsl_status.hsl_lightness);
+            ESP_LOGI(BLEMESH_TAG, "ESP_BLE_MESH_MODEL_OP_LIGHT_HSL_STATUS, hue %0x%04" PRIx16 " saturation %0x%04" PRIx16 " lightness %0x%04" PRIx16, param->status_cb.hsl_status.hsl_hue, param->status_cb.hsl_status.hsl_saturation, param->status_cb.hsl_status.hsl_lightness);
         }
         break;
     case ESP_BLE_MESH_LIGHT_CLIENT_TIMEOUT_EVT:
-        ESP_LOGE(TAG, "ESP_BLE_MESH_LIGHT_CLIENT_TIMEOUT_EVT");
+        ESP_LOGE(BLEMESH_TAG, "ESP_BLE_MESH_LIGHT_CLIENT_TIMEOUT_EVT");
         if (param->params->opcode == ESP_BLE_MESH_MODEL_OP_LIGHT_HSL_SET) {
             /* If failed to get the response of Light HSL Set, resend Light HSL Set  */
             // example_ble_mesh_send_light_hsl_set();
@@ -508,21 +599,510 @@ static esp_err_t ble_mesh_init(void)
 
     err = esp_ble_mesh_init(&provision, &composition);
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to initialize mesh stack (err %d)", err);
+        ESP_LOGE(BLEMESH_TAG, "Failed to initialize mesh stack (err %d)", err);
         return err;
     }
 
-    err = esp_ble_mesh_node_prov_enable(ESP_BLE_MESH_PROV_ADV | ESP_BLE_MESH_PROV_GATT);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to enable mesh node (err %d)", err);
-        return err;
-    }
+    // err = esp_ble_mesh_node_prov_enable(ESP_BLE_MESH_PROV_ADV | ESP_BLE_MESH_PROV_GATT);
+    // if (err != ESP_OK) {
+    //     ESP_LOGE(BLEMESH_TAG, "Failed to enable mesh node (err %d)", err);
+    //     return err;
+    // }
 
-    ESP_LOGI(TAG, "BLE Mesh Node initialized");
+    ESP_LOGI(BLEMESH_TAG, "BLE Mesh Node initialized");
 
     // board_led_operation(LED_G, LED_ON);
 
     return err;
+}
+
+static void parse_guider_response(const char *data, int len, nvs_handle_t nvs_handle)
+{
+    cJSON * root_node = cJSON_ParseWithLength(data, (size_t)len);
+    if (root_node) {
+        cJSON * data_node = cJSON_GetObjectItem(root_node, "data");
+        if (data_node) {
+            cJSON * resources_node = cJSON_GetObjectItem(data_node, "resources");
+            if (resources_node) {
+                cJSON * mqtt_node = cJSON_GetObjectItem(resources_node, "mqtt");
+                if (mqtt_node) {
+                    cJSON * host_node = cJSON_GetObjectItem(mqtt_node, "host");
+                    cJSON * port_node = cJSON_GetObjectItem(mqtt_node, "port");
+                    if (host_node && port_node) {
+                        const char * host = cJSON_GetStringValue(host_node);
+                        uint16_t port = (uint16_t)cJSON_GetNumberValue(port_node);
+                        if (host && port) {
+                            ESP_ERROR_CHECK( nvs_set_str(nvs_handle, "host", host) );
+                            ESP_ERROR_CHECK( nvs_set_u16(nvs_handle, "port", port) );
+                            ESP_ERROR_CHECK( nvs_commit(nvs_handle) );
+                        }
+                    }
+                }
+            }
+        }
+
+        cJSON_Delete(root_node);
+    }
+}
+
+static esp_err_t http_event_handler(esp_http_client_event_t *event)
+{
+    static char *output_buffer;  // Buffer to store response of http request from event handler
+    static int output_len;       // Stores number of bytes read
+    switch(event->event_id) {
+        case HTTP_EVENT_ERROR:
+            ESP_LOGD(ALIYUN_TAG, "HTTP_EVENT_ERROR");
+            break;
+        case HTTP_EVENT_ON_CONNECTED:
+            ESP_LOGD(ALIYUN_TAG, "HTTP_EVENT_ON_CONNECTED");
+            break;
+        case HTTP_EVENT_HEADER_SENT:
+            ESP_LOGD(ALIYUN_TAG, "HTTP_EVENT_HEADER_SENT");
+            break;
+        case HTTP_EVENT_ON_HEADER:
+            ESP_LOGD(ALIYUN_TAG, "HTTP_EVENT_ON_HEADER, key=%s, value=%s", event->header_key, event->header_value);
+            break;
+        case HTTP_EVENT_ON_DATA:
+            ESP_LOGD(ALIYUN_TAG, "HTTP_EVENT_ON_DATA, len=%d", event->data_len);
+            /*
+             *  Check for chunked encoding is added as the URL for chunked encoding used in this example returns binary data.
+             *  However, event handler can also be used in case chunked encoding is used.
+             */
+            if (!esp_http_client_is_chunked_response(event->client)) {
+                if (output_buffer == NULL) {
+                    output_buffer = (char *) malloc(esp_http_client_get_content_length(event->client));
+                    output_len = 0;
+                    if (output_buffer == NULL) {
+                        ESP_LOGE(ALIYUN_TAG, "Failed to allocate memory for output buffer");
+                        return ESP_FAIL;
+                    }
+                }
+                memcpy(output_buffer + output_len, event->data, event->data_len);
+                output_len += event->data_len;
+            }
+
+            break;
+        case HTTP_EVENT_ON_FINISH:
+            ESP_LOGD(ALIYUN_TAG, "HTTP_EVENT_ON_FINISH");
+            if (output_buffer != NULL) {
+                // Response is accumulated in output_buffer. Uncomment the below line to print the accumulated response
+                ESP_LOGI(ALIYUN_TAG, "%.*s", output_len, output_buffer);
+                
+                parse_guider_response(output_buffer, output_len, (nvs_handle_t)event->user_data);
+
+                free(output_buffer);
+                output_buffer = NULL;
+            }
+            output_len = 0;
+            break;
+        case HTTP_EVENT_DISCONNECTED:
+            ESP_LOGI(ALIYUN_TAG, "HTTP_EVENT_DISCONNECTED");
+            int mbedtls_err = 0;
+            esp_err_t err = esp_tls_get_and_clear_last_error((esp_tls_error_handle_t)event->data, &mbedtls_err, NULL);
+            if (err != 0) {
+                ESP_LOGI(ALIYUN_TAG, "Last esp error code: 0x%x", err);
+                ESP_LOGI(ALIYUN_TAG, "Last mbedtls failure: 0x%x", mbedtls_err);
+            }
+            if (output_buffer != NULL) {
+                free(output_buffer);
+                output_buffer = NULL;
+            }
+            output_len = 0;
+            break;
+        case HTTP_EVENT_REDIRECT:
+            ESP_LOGD(ALIYUN_TAG, "HTTP_EVENT_REDIRECT");
+            break;
+    }
+
+    return ESP_OK;
+}
+
+static void time_update_routine(void *arg)
+{
+    struct mqtt_event_handler_args *args = arg;
+
+    while (esp_mqtt_client_subscribe(args->client, args->gateway_ntp_response_topic, 0) < 0) {
+        vTaskDelay(pdMS_TO_TICKS(2000));
+    }
+
+    for (;;) {
+        char *data = NULL;
+        int data_len = asprintf(&data, "{\"deviceSendTime\":%" PRIu64 "}", time(NULL));
+        assert(data);
+
+        char *topic = NULL;
+        asprintf(&topic, "/ext/ntp/%s/%s/request", args->product_key, args->device_name);
+        assert(topic);
+        while (esp_mqtt_client_publish(args->client, topic, data, data_len, 0, 0) < 0) {
+            ESP_LOGE(ALIYUN_TAG, "time update failed");
+            vTaskDelay(pdMS_TO_TICKS(2000));
+        }
+
+        free(topic);
+    
+        ESP_LOGI(ALIYUN_TAG, "request time update: %s", data);
+        free(data);
+
+        vTaskDelay(pdMS_TO_TICKS(60000 * 30));
+    }
+}
+
+static void do_time_update(const char *data, int len)
+{
+    uint64_t device_recv_time = time(NULL);
+
+    cJSON * root_node = cJSON_ParseWithLength(data, len);
+    if (root_node) {
+        cJSON * device_send_time_node = cJSON_GetObjectItem(root_node, "deviceSendTime");
+        cJSON * server_recv_time_node = cJSON_GetObjectItem(root_node, "serverRecvTime");
+        cJSON * server_send_time_node = cJSON_GetObjectItem(root_node, "serverSendTime");
+
+        if (device_send_time_node && server_recv_time_node && server_send_time_node) {
+            uint64_t device_send_time = cJSON_GetNumberValue(device_send_time_node);
+            uint64_t server_recv_time = cJSON_GetNumberValue(server_recv_time_node);
+            uint64_t server_send_time = cJSON_GetNumberValue(server_send_time_node);
+
+            uint64_t now = (server_recv_time + server_send_time + device_recv_time - device_send_time) / 2;
+
+            struct timeval tv = {
+                .tv_sec = now / 1000,
+                .tv_usec = (now % 1000) * 1000,
+            };
+
+            setenv("TZ", "UTC-8", 1);
+            settimeofday(&tv, NULL);
+
+            ESP_LOGI(ALIYUN_TAG, "time updated: %s", esp_log_system_timestamp());
+        }
+
+        cJSON_Delete(root_node);
+    }
+}
+
+static uint32_t get_next_alink_id() {
+    static uint32_t alink_id;
+    return alink_id++;
+}
+
+static void publish_alink_msg(esp_mqtt_client_handle_t client, const char *topic, cJSON *payload_node, int qos, int retain) {
+    cJSON *root_node = cJSON_CreateObject();
+    cJSON_AddNumberToObject(root_node, "id", get_next_alink_id());
+    cJSON_AddStringToObject(root_node, "version", "1.0");
+    cJSON_AddItemToObject(root_node, "params", payload_node);
+    char *msg = cJSON_PrintUnformatted(root_node);
+    cJSON_Delete(root_node);
+    while (esp_mqtt_client_publish(client, topic, msg, strlen(msg), qos, retain) < 0);
+    cJSON_free(msg);
+}
+
+static void report_progress(esp_mqtt_client_handle_t client, const char *product_key, const char *device_name, int progress, int qos, int retain) {
+    cJSON *payload_node = cJSON_CreateObject();
+    cJSON_AddStringToObject(payload_node, "desc", "");
+    cJSON_AddNumberToObject(payload_node, "step", progress);
+    char *topic = NULL;
+    asprintf(&topic, "/ota/device/progress/%s/%s", product_key, device_name);
+    assert(topic);
+    publish_alink_msg(client, topic, payload_node, qos, retain);
+    free(topic);
+}
+
+static void report_version(esp_mqtt_client_handle_t client, const char *product_key, const char *device_name, const char *version, int qos, int retain) {
+    cJSON *payload_node = cJSON_CreateObject();
+    cJSON_AddStringToObject(payload_node, "version", version);
+    char *topic = NULL;
+    asprintf(&topic, "/ota/device/inform/%s/%s", product_key, device_name);
+    assert(topic);
+    publish_alink_msg(client, topic, payload_node, qos, retain);
+    free(topic);
+}
+
+static void do_https_ota_upgrade(esp_mqtt_client_handle_t client, const char *product_key, const char *device_name, const char *url, size_t size) {
+    esp_http_client_config_t config = {
+        .url = url,
+        .crt_bundle_attach = esp_crt_bundle_attach,
+    };
+
+    esp_https_ota_config_t ota_config = {
+        .http_config = &config,
+    };
+
+    ESP_LOGI(ALIYUN_TAG, "Attempting to download update from %s", config.url);
+    esp_err_t ret = esp_https_ota(&ota_config);
+    if (ret == ESP_OK) {
+        ESP_LOGI(ALIYUN_TAG, "OTA Succeed, Rebooting...");
+        report_progress(client, product_key, device_name, 100, 1, 0);
+        esp_restart();
+    } else {
+        ESP_LOGE(ALIYUN_TAG, "Firmware upgrade failed");
+        report_progress(client, product_key, device_name, -1, 1, 0);
+        esp_restart();
+    }
+}
+
+static void request_mqtt_download(esp_mqtt_client_handle_t client, const char *product_key, const char *device_name, const char *file_token, uint32_t stream_id, uint32_t file_id, uint32_t size, uint32_t offset, int qos, int retain) {
+        
+    cJSON *payload_node = cJSON_CreateObject();
+    if (file_token) {
+        cJSON_AddStringToObject(payload_node, "fileToken", file_token);
+    }
+
+    cJSON *file_info_node = cJSON_CreateObject();
+    cJSON_AddNumberToObject(file_info_node, "streamId", stream_id);
+    cJSON_AddNumberToObject(file_info_node, "fileId", file_id);
+    cJSON_AddItemToObject(payload_node, "fileInfo", file_info_node);
+    
+    cJSON *file_block_node = cJSON_CreateObject();
+    cJSON_AddNumberToObject(file_block_node, "size", size);
+    cJSON_AddNumberToObject(file_block_node, "offset", offset);
+    cJSON_AddItemToObject(payload_node, "fileBlock", file_block_node);
+
+    char *topic = NULL;
+    asprintf(&topic, "/sys/%s/%s/thing/file/download", product_key, device_name);
+    assert(topic);
+    publish_alink_msg(client, topic, payload_node, qos, retain);
+    free(topic);
+}
+
+static uint16_t crc_ibm(uint8_t const *buffer, size_t len)
+{
+    /*
+     * CRC lookup table for bytes, generating polynomial is 0x8005
+     * input: reflexed (LSB first)
+     * output: reflexed also...
+     */
+    const static uint16_t crc_ibm_table[512] = {
+        0x0000, 0xc0c1, 0xc181, 0x0140, 0xc301, 0x03c0, 0x0280, 0xc241,
+        0xc601, 0x06c0, 0x0780, 0xc741, 0x0500, 0xc5c1, 0xc481, 0x0440,
+        0xcc01, 0x0cc0, 0x0d80, 0xcd41, 0x0f00, 0xcfc1, 0xce81, 0x0e40,
+        0x0a00, 0xcac1, 0xcb81, 0x0b40, 0xc901, 0x09c0, 0x0880, 0xc841,
+        0xd801, 0x18c0, 0x1980, 0xd941, 0x1b00, 0xdbc1, 0xda81, 0x1a40,
+        0x1e00, 0xdec1, 0xdf81, 0x1f40, 0xdd01, 0x1dc0, 0x1c80, 0xdc41,
+        0x1400, 0xd4c1, 0xd581, 0x1540, 0xd701, 0x17c0, 0x1680, 0xd641,
+        0xd201, 0x12c0, 0x1380, 0xd341, 0x1100, 0xd1c1, 0xd081, 0x1040,
+        0xf001, 0x30c0, 0x3180, 0xf141, 0x3300, 0xf3c1, 0xf281, 0x3240,
+        0x3600, 0xf6c1, 0xf781, 0x3740, 0xf501, 0x35c0, 0x3480, 0xf441,
+        0x3c00, 0xfcc1, 0xfd81, 0x3d40, 0xff01, 0x3fc0, 0x3e80, 0xfe41,
+        0xfa01, 0x3ac0, 0x3b80, 0xfb41, 0x3900, 0xf9c1, 0xf881, 0x3840,
+        0x2800, 0xe8c1, 0xe981, 0x2940, 0xeb01, 0x2bc0, 0x2a80, 0xea41,
+        0xee01, 0x2ec0, 0x2f80, 0xef41, 0x2d00, 0xedc1, 0xec81, 0x2c40,
+        0xe401, 0x24c0, 0x2580, 0xe541, 0x2700, 0xe7c1, 0xe681, 0x2640,
+        0x2200, 0xe2c1, 0xe381, 0x2340, 0xe101, 0x21c0, 0x2080, 0xe041,
+        0xa001, 0x60c0, 0x6180, 0xa141, 0x6300, 0xa3c1, 0xa281, 0x6240,
+        0x6600, 0xa6c1, 0xa781, 0x6740, 0xa501, 0x65c0, 0x6480, 0xa441,
+        0x6c00, 0xacc1, 0xad81, 0x6d40, 0xaf01, 0x6fc0, 0x6e80, 0xae41,
+        0xaa01, 0x6ac0, 0x6b80, 0xab41, 0x6900, 0xa9c1, 0xa881, 0x6840,
+        0x7800, 0xb8c1, 0xb981, 0x7940, 0xbb01, 0x7bc0, 0x7a80, 0xba41,
+        0xbe01, 0x7ec0, 0x7f80, 0xbf41, 0x7d00, 0xbdc1, 0xbc81, 0x7c40,
+        0xb401, 0x74c0, 0x7580, 0xb541, 0x7700, 0xb7c1, 0xb681, 0x7640,
+        0x7200, 0xb2c1, 0xb381, 0x7340, 0xb101, 0x71c0, 0x7080, 0xb041,
+        0x5000, 0x90c1, 0x9181, 0x5140, 0x9301, 0x53c0, 0x5280, 0x9241,
+        0x9601, 0x56c0, 0x5780, 0x9741, 0x5500, 0x95c1, 0x9481, 0x5440,
+        0x9c01, 0x5cc0, 0x5d80, 0x9d41, 0x5f00, 0x9fc1, 0x9e81, 0x5e40,
+        0x5a00, 0x9ac1, 0x9b81, 0x5b40, 0x9901, 0x59c0, 0x5880, 0x9841,
+        0x8801, 0x48c0, 0x4980, 0x8941, 0x4b00, 0x8bc1, 0x8a81, 0x4a40,
+        0x4e00, 0x8ec1, 0x8f81, 0x4f40, 0x8d01, 0x4dc0, 0x4c80, 0x8c41,
+        0x4400, 0x84c1, 0x8581, 0x4540, 0x8701, 0x47c0, 0x4680, 0x8641,
+        0x8201, 0x42c0, 0x4380, 0x8341, 0x4100, 0x81c1, 0x8081, 0x4040,
+    };
+
+    uint16_t crc = 0x0000;
+    uint8_t lut;
+
+    while (len--) {
+        lut = (crc ^ (*buffer++)) & 0xFF;
+        crc = (crc >> 8) ^ crc_ibm_table[lut];
+    }
+    return crc;
+}
+
+static int verify_mqtt_file_data(uint8_t *data, uint16_t block_size, uint16_t crc16) {
+    uint16_t fact_crc16 = crc_ibm(data, block_size);
+    if (fact_crc16 != crc16) {
+        ESP_LOGI(ALIYUN_TAG, "crc16 mismatch: fact crc16 is 0x%04x, crc16 is 0x%04x", fact_crc16, crc16);
+    }
+    return fact_crc16 == crc16;
+}
+
+static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_t event_id, void *event_data)
+{
+    struct mqtt_event_handler_args *args = handler_args;
+    assert(args);
+
+    ESP_LOGD(ALIYUN_TAG, "Event dispatched from event loop base=%s, event_id=%d", base, event_id);
+    esp_mqtt_event_handle_t event = event_data;
+    switch ((esp_mqtt_event_id_t)event_id) {
+        case MQTT_EVENT_CONNECTED: {
+            ESP_LOGI(ALIYUN_TAG, "MQTT_EVENT_CONNECTED");
+            report_version(args->client, args->product_key, args->device_name, esp_app_get_description()->version, 1, 0);
+            while (esp_mqtt_client_subscribe(args->client, args->gateway_ota_download_reply_topic, 0) < 0);
+            break;
+        }
+        case MQTT_EVENT_DISCONNECTED: {
+            ESP_LOGI(ALIYUN_TAG, "MQTT_EVENT_DISCONNECTED");
+            break;
+        }
+        case MQTT_EVENT_SUBSCRIBED: {
+            ESP_LOGI(ALIYUN_TAG, "MQTT_EVENT_SUBSCRIBED, msg_id=%d", event->msg_id);
+            break;
+        }
+        case MQTT_EVENT_UNSUBSCRIBED: {
+            ESP_LOGI(ALIYUN_TAG, "MQTT_EVENT_UNSUBSCRIBED, msg_id=%d", event->msg_id);
+            break;
+        }
+        case MQTT_EVENT_PUBLISHED: {
+            // ESP_LOGI(ALIYUN_TAG, "MQTT_EVENT_PUBLISHED, msg_id=%d", event->msg_id);
+            break;
+        }
+        case MQTT_EVENT_DATA: {
+            if (strncmp(args->gateway_ntp_response_topic, event->topic, event->topic_len - 1) == 0) {
+                ESP_LOGI(ALIYUN_TAG, "MQTT_EVENT_DATA, topic=%.*s, msg_id=%d, data=%.*s", event->topic_len, event->topic, event->msg_id, event->data_len, event->data);
+                ESP_LOGI(ALIYUN_TAG ,"%s", "NTP Response Received");
+                do_time_update(event->data, event->data_len);
+            }
+            else if (strncmp(args->gateway_ota_topic, event->topic, event->topic_len) == 0) {
+                ESP_LOGI(ALIYUN_TAG, "MQTT_EVENT_DATA, topic=%.*s, msg_id=%d, data=%.*s", event->topic_len, event->topic, event->msg_id, event->data_len, event->data);
+                ESP_LOGI(ALIYUN_TAG, "%s", "OTA Request Received");
+                cJSON * root_node = cJSON_ParseWithLength(event->data, event->data_len);
+                if (root_node) {
+                    cJSON * data_node = cJSON_GetObjectItem(root_node, "data");
+                    if (data_node) {
+                        cJSON * version_node = cJSON_GetObjectItem(data_node, "version");
+                        cJSON * url_node = cJSON_GetObjectItem(data_node, "url");
+                        cJSON * size_node = cJSON_GetObjectItem(data_node, "size");
+                        cJSON * stream_id_node = cJSON_GetObjectItem(data_node, "streamId");
+                        cJSON * file_id_node = cJSON_GetObjectItem(data_node, "streamFileId");
+                        if (version_node && size_node) {
+                            const char *version = cJSON_GetStringValue(version_node);
+                            size_t size = cJSON_GetNumberValue(size_node);
+                            if (strcmp(version, esp_app_get_description()->version) == 0) {
+                                report_version(args->client, args->product_key, args->device_name, version, 1, 0);
+                            }
+                            else {
+                                if (url_node) {
+                                    const char *url = cJSON_GetStringValue(url_node);
+                                    do_https_ota_upgrade(args->client, args->product_key, args->device_name, url, size);
+                                }
+                                else if (stream_id_node && file_id_node) {
+                                    args->last_progress = 0;
+                                    args->stream_id = cJSON_GetNumberValue(stream_id_node);
+                                    args->file_id = cJSON_GetNumberValue(file_id_node);
+                                    args->ota_partition = esp_ota_get_next_update_partition(NULL);
+                                    ESP_ERROR_CHECK( esp_ota_begin(args->ota_partition, size, &args->ota_handle) );
+                                    if (xSemaphoreTake(args->gateway_ota_upgrading_sem, 0) == pdTRUE) {
+                                        request_mqtt_download(args->client, args->product_key, args->device_name, NULL, args->stream_id, args->file_id, min(512, (uint32_t)size), 0, 1, 0);
+                                    }
+                                    else {
+                                        ESP_LOGE(ALIYUN_TAG, "Another MQTT upgrade is running");
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    cJSON_Delete(root_node);
+                }
+            }
+            else if (strncmp(args->gateway_ota_download_reply_topic, event->topic, event->topic_len) == 0) {
+                // ESP_LOGI(ALIYUN_TAG, "MQTT_EVENT_DATA, topic=%.*s, msg_id=%d", event->topic_len, event->topic, event->msg_id);
+                if (event->data_len > 4) {
+                    uint16_t json_size = event->data[0];
+                    json_size <<= 8;
+                    json_size |= event->data[1];
+                    // ESP_LOGI(ALIYUN_TAG, "%.*s", json_size, event->data + 2);
+                    if (json_size + 2 <= event->data_len) {
+                        cJSON * root_node = cJSON_ParseWithLength(event->data + 2, json_size);
+                        if (root_node) {
+                            cJSON *data_node = cJSON_GetObjectItem(root_node, "data");
+                            if (data_node) {
+                                cJSON *block_size_node = cJSON_GetObjectItem(data_node, "bSize");
+                                cJSON *block_offset_node = cJSON_GetObjectItem(data_node, "bOffset");
+                                cJSON *file_length_node = cJSON_GetObjectItem(data_node, "fileLength");
+                                cJSON *file_token_node = cJSON_GetObjectItem(data_node, "fileToken");
+
+                                if (file_token_node) {
+                                    const char *file_token = cJSON_GetStringValue(file_token_node);
+                                    ESP_LOGI(ALIYUN_TAG, "file token: %s", file_token);
+                                }
+
+                                if (block_size_node && block_offset_node && file_length_node) {
+                                    uint32_t block_size = cJSON_GetNumberValue(block_size_node);
+                                    uint32_t block_offset = cJSON_GetNumberValue(block_offset_node);
+                                    uint32_t file_length = cJSON_GetNumberValue(file_length_node);
+                                    if (2 + json_size + block_size + 2 == event->data_len) {
+                                        uint8_t *block = (uint8_t*)event->data + 2 + json_size;
+                                        uint8_t *block_end = block + block_size;
+                                        uint16_t crc16 = block_end[1];
+                                        crc16 <<= 8;
+                                        crc16 |= block_end[0];
+                                        if (verify_mqtt_file_data(block, block_size, crc16)) {
+                                            ESP_ERROR_CHECK( esp_ota_write_with_offset(args->ota_handle, block, block_size, block_offset) );
+
+                                            // ESP_LOGI(ALIYUN_TAG, "Upgrading %" PRIu32 "/%" PRIu32 " bytes", block_offset + block_size, file_length);
+
+                                            int progress = (block_offset + block_size) * 100;
+                                            progress /= file_length;
+                                            if (args->last_progress + 1 <= progress) {
+                                                ESP_LOGI(ALIYUN_TAG, "Upgrading: %d%%", progress);
+                                                report_progress(args->client, args->product_key, args->device_name, progress, 0, 0);
+                                                args->last_progress = progress;
+                                            }
+
+                                            if (block_offset + block_size == file_length) {
+                                                ESP_ERROR_CHECK( esp_ota_end(args->ota_handle) );
+                                                ESP_ERROR_CHECK( esp_ota_set_boot_partition(args->ota_partition) );
+                                                ESP_LOGI(ALIYUN_TAG, "Upgraded");
+                                                esp_restart();
+                                            }
+                                            else {
+                                                request_mqtt_download(args->client, args->product_key, args->device_name, NULL, args->stream_id, args->file_id, min(512, file_length - block_offset - block_size), block_offset + block_size, 1, 0);
+                                            }
+                                        }
+                                        else {
+                                            ESP_LOGE(ALIYUN_TAG, "failed CRC16/IBM verification");
+                                            request_mqtt_download(args->client, args->product_key, args->device_name, NULL, args->stream_id, args->file_id, block_size, block_offset, 1, 0);
+                                        }
+                                    }
+                                }
+                            }
+                            cJSON_Delete(root_node);
+                        }
+                    }
+                }
+            }
+            break;
+        }
+        case MQTT_EVENT_ERROR: {
+            ESP_LOGI(ALIYUN_TAG, "MQTT_EVENT_ERROR");
+            if (event->error_handle->error_type == MQTT_ERROR_TYPE_TCP_TRANSPORT) {
+                ESP_LOGI(ALIYUN_TAG, "Last error code reported from esp-tls: 0x%x", event->error_handle->esp_tls_last_esp_err);
+                ESP_LOGI(ALIYUN_TAG, "Last tls stack error number: 0x%x", event->error_handle->esp_tls_stack_err);
+                ESP_LOGI(ALIYUN_TAG, "Last captured errno : %d (%s)", event->error_handle->esp_transport_sock_errno,
+                         strerror(event->error_handle->esp_transport_sock_errno));
+            }
+            else if (event->error_handle->error_type == MQTT_ERROR_TYPE_CONNECTION_REFUSED) {
+                ESP_LOGI(ALIYUN_TAG, "Connection refused error: 0x%x", event->error_handle->connect_return_code);
+            }
+            else {
+                ESP_LOGW(ALIYUN_TAG, "Unknown error type: 0x%x", event->error_handle->error_type);
+            }
+            break;
+        }
+        case MQTT_EVENT_BEFORE_CONNECT: {
+            ESP_LOGI(ALIYUN_TAG, "MQTT_EVENT_BEFORE_CONNECT");
+            break;
+        }
+        case MQTT_EVENT_DELETED: {
+            ESP_LOGI(ALIYUN_TAG, "MQTT_EVENT_DELETED");
+            break;
+        }
+        case MQTT_USER_EVENT: {
+            ESP_LOGI(ALIYUN_TAG, "MQTT_USER_EVENT");
+            break;
+        }
+        default: {
+            break;
+        }
+    }
 }
 
 void app_main(void)
@@ -535,6 +1115,8 @@ void app_main(void)
         err = nvs_flash_init();
     }
     ESP_ERROR_CHECK(err);
+    ESP_ERROR_CHECK( nvs_flash_init_partition(CONFIG_BLE_MESH_PARTITION_NAME) );
+    ESP_ERROR_CHECK( nvs_flash_init_partition(CONFIG_PARTITION) );
 
     // Initialize TCP/IP network interface aka the esp-netif (should be called only once in application)
     ESP_ERROR_CHECK(esp_netif_init());
@@ -610,9 +1192,118 @@ void app_main(void)
         ESP_ERROR_CHECK(esp_eth_start(eth_handles[i]));
     }
 
+    nvs_handle_t config_nvs_handle;
+    ESP_ERROR_CHECK( nvs_open_from_partition(CONFIG_PARTITION, CONFIG_PARTITION, NVS_READONLY, &config_nvs_handle) );
+    LOAD_NVS_STR(config_nvs_handle, server_cer);
+    LOAD_NVS_STR(config_nvs_handle, client_cer);
+    LOAD_NVS_STR(config_nvs_handle, client_key);
+    LOAD_NVS_STR(config_nvs_handle, product_key);
+    LOAD_NVS_STR(config_nvs_handle, device_name);
+    LOAD_NVS_STR(config_nvs_handle, device_secret);
+    nvs_close(config_nvs_handle);
+
+    nvs_handle_t mqtt_nvs_handle;
+    ESP_ERROR_CHECK( nvs_open("mqtt", NVS_READWRITE, &mqtt_nvs_handle) );
+    
+    LOAD_OPT_NVS_U16(mqtt_nvs_handle, port);
+    LOAD_OPT_NVS_STR(mqtt_nvs_handle, host);
+    LOAD_OPT_NVS_STR(mqtt_nvs_handle, username);
+    LOAD_OPT_NVS_STR(mqtt_nvs_handle, password);
+    LOAD_OPT_NVS_STR(mqtt_nvs_handle, client_id);
+
+    int bootstrap_required = !host_found || !username_found || !password_found || !client_id_found || !port_found;
+    ESP_LOGI(ALIYUN_TAG, "bootstrap_required: %d", bootstrap_required);
+
+    if (bootstrap_required) {
+        char *post_data = NULL;
+        int post_data_len = asprintf(&post_data, "productKey=%s&deviceName=%s", product_key, device_name);
+        assert(post_data);
+
+        esp_http_client_config_t config = {
+            .host = "iot-auth-global.aliyuncs.com",
+            .path = "/auth/bootstrap",
+            .transport_type = HTTP_TRANSPORT_OVER_SSL,
+            .event_handler = http_event_handler,
+            .user_data = (void*)mqtt_nvs_handle,
+            .method = HTTP_METHOD_POST,
+            .crt_bundle_attach = esp_crt_bundle_attach,
+        };
+        esp_http_client_handle_t client = esp_http_client_init(&config);
+        esp_http_client_set_post_field(client, post_data, post_data_len);
+        esp_http_client_set_header(client, "Content-Type", "application/x-www-form-urlencoded");
+
+        while (ESP_OK != esp_http_client_perform(client)) {
+            vTaskDelay(pdMS_TO_TICKS(2000));
+        }
+
+        esp_http_client_cleanup(client);
+
+        free(post_data);
+
+        assert( nvs_get_str(mqtt_nvs_handle, "host", NULL, &host_size) == ESP_OK
+            && nvs_get_u16(mqtt_nvs_handle, "port", &port) == ESP_OK );
+        
+        char *hmac_source = NULL;
+        int hmac_source_len = asprintf(&hmac_source, "clientId%s.%sdeviceName%sproductKey%s", product_key, device_name, device_name, product_key);
+        ESP_LOGI(ALIYUN_TAG, "%s", hmac_source);
+        assert(hmac_source);
+        
+        unsigned char hmac[32];
+        mbedtls_md_context_t ctx;
+        mbedtls_md_init(&ctx);
+        assert( mbedtls_md_setup(&ctx, mbedtls_md_info_from_type(MBEDTLS_MD_SHA256), 1) == 0 );
+        assert( mbedtls_md_hmac_starts(&ctx, (const unsigned char *)device_secret, strlen(device_secret)) == 0);
+        assert( mbedtls_md_hmac_update(&ctx, (const unsigned char *)hmac_source, hmac_source_len) == 0);
+        assert( mbedtls_md_hmac_finish(&ctx, hmac) == 0);
+        mbedtls_md_free(&ctx);
+        free(hmac_source);
+
+        char password[65];
+        for (int i = 0; i < 32; i++) {
+            sprintf(password + (i * 2), "%02x", hmac[i]);
+        }
+        ESP_ERROR_CHECK( nvs_set_str(mqtt_nvs_handle, "password", password) );
+
+        char *username = NULL;
+        asprintf(&username, "%s&%s", device_name, product_key);
+        assert(username);
+        ESP_ERROR_CHECK( nvs_set_str(mqtt_nvs_handle, "username", username) );
+        free(username);
+
+        char *client_id = NULL;
+        asprintf(&client_id, "%s.%s|securemode=%d,signmethod=hmacsha256|", product_key, device_name, 2);
+        assert(client_id);
+        ESP_ERROR_CHECK( nvs_set_str(mqtt_nvs_handle, "client_id", client_id) );
+        free(client_id);
+
+        ESP_ERROR_CHECK( nvs_commit(mqtt_nvs_handle) );
+    }
+
+    if (!host_found) {
+        RETRY_LOAD_OPT_NVS_STR(mqtt_nvs_handle, host);
+    }
+
+    if (!port_found) {
+        RETRY_LOAD_OPT_NVS_U16(mqtt_nvs_handle, port);
+    }
+
+    if (!username_found) {
+        RETRY_LOAD_OPT_NVS_STR(mqtt_nvs_handle, username);
+    }
+
+    if (!password_found) {
+        RETRY_LOAD_OPT_NVS_STR(mqtt_nvs_handle, password);
+    }
+
+    if (!client_id_found) {
+        RETRY_LOAD_OPT_NVS_STR(mqtt_nvs_handle, client_id);
+    }
+
+    nvs_close(mqtt_nvs_handle);
+
     err = bluetooth_init();
     if (err) {
-        ESP_LOGE(TAG, "esp32_bluetooth_init failed (err %d)", err);
+        ESP_LOGE(BLEMESH_TAG, "esp32_bluetooth_init failed (err %d)", err);
         return;
     }
 
@@ -627,11 +1318,57 @@ void app_main(void)
     /* Initialize the Bluetooth Mesh Subsystem */
     err = ble_mesh_init();
     if (err) {
-        ESP_LOGE(TAG, "Bluetooth mesh init failed (err %d)", err);
+        ESP_LOGE(BLEMESH_TAG, "Bluetooth mesh init failed (err %d)", err);
     }
 
-    for (;;) {
-        example_ble_mesh_send_gen_onoff_get();
-        vTaskDelay(pdMS_TO_TICKS(1000));
-    }
+    const esp_mqtt_client_config_t mqtt_cfg = {
+        .broker = {
+            .address = {
+                .hostname = host,
+                .port = port,
+                .transport = MQTT_TRANSPORT_OVER_SSL,
+            },
+            .verification = {
+                .certificate = server_cer,
+                .certificate_len = server_cer_size,
+            },
+        },
+        .credentials = {
+            .client_id = client_id,
+            .username = username,
+            .authentication = {
+                .password = password,
+                .certificate = client_cer,
+                .certificate_len = client_cer_size,
+                .key = client_key,
+                .key_len = client_key_size,
+            },
+        },
+    };
+
+    static struct mqtt_event_handler_args args;
+    
+    while (!(args.client = esp_mqtt_client_init(&mqtt_cfg)));
+    asprintf(&args.gateway_ota_topic, "/ota/device/upgrade/%s/%s", product_key, device_name);
+    assert(args.gateway_ota_topic);
+    ESP_LOGI(ALIYUN_TAG, "gateway_ota_topic: %s", args.gateway_ota_topic);
+
+    asprintf(&args.gateway_ntp_response_topic, "/ext/ntp/%s/%s/response", product_key, device_name);
+    assert(args.gateway_ntp_response_topic);
+    ESP_LOGI(ALIYUN_TAG, "gateway_ntp_response_topic: %s", args.gateway_ntp_response_topic);
+
+    asprintf(&args.gateway_ota_download_reply_topic, "/sys/%s/%s/thing/file/download_reply", product_key, device_name);
+    assert(args.gateway_ota_download_reply_topic);
+    ESP_LOGI(ALIYUN_TAG, "gateway_ota_download_reply_topic: %s", args.gateway_ota_download_reply_topic);
+
+    args.server_cer = server_cer;
+    args.product_key = product_key;
+    args.device_name = device_name;
+    args.gateway_ota_upgrading_sem = xSemaphoreCreateBinary();
+    xSemaphoreGive(args.gateway_ota_upgrading_sem);
+
+    xTaskCreate(time_update_routine, "time_update_task", 2048, &args, tskIDLE_PRIORITY + 1, NULL);
+
+    esp_mqtt_client_register_event(args.client, ESP_EVENT_ANY_ID, mqtt_event_handler, &args);
+    esp_mqtt_client_start(args.client);
 }

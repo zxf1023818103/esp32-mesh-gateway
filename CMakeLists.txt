@@ -8,3 +8,11 @@ include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 project(esp32-mesh-gateway)
 
 SET(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Werror=format=0" CACHE STRING "" FORCE)
+
+add_custom_target(config_bin
+                  COMMAND python $ENV{IDF_PATH}/components/nvs_flash/nvs_partition_generator/nvs_partition_gen.py generate --version 2 --outdir ${CMAKE_BINARY_DIR} "test.csv" config.bin 0x3000
+                  WORKING_DIRECTORY ${CMAKE_CURRENT_LIST_DIR})
+
+add_dependencies(flash config_bin)
+
+esptool_py_flash_to_partition(flash "config" ${CMAKE_BINARY_DIR}/config.bin)

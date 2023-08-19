@@ -1,0 +1,8 @@
+key,type,encoding,value
+config,namespace,,
+server_cer,file,string,certs/product/server.cer
+client_cer,file,string,certs/product/client.cer
+client_key,file,string,certs/product/client.key
+product_key,data,string,a1EombXbPEE
+device_name,data,string,nLENh4StRERRFrSiWMU8
+device_secret,data,string,563bc285c4e7107d21e80d6a96b5a30a
