@@ -9,9 +9,11 @@ project(esp32-mesh-gateway)
 
 SET(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Werror=format=0" CACHE STRING "" FORCE)
 
+SET(CONFIG_NAME "test")
+
 add_custom_target(config_bin
-                  COMMAND python $ENV{IDF_PATH}/components/nvs_flash/nvs_partition_generator/nvs_partition_gen.py generate --version 2 --outdir ${CMAKE_BINARY_DIR} "test.csv" config.bin 0x3000
-                  WORKING_DIRECTORY ${CMAKE_CURRENT_LIST_DIR})
+                  COMMAND python $ENV{IDF_PATH}/components/nvs_flash/nvs_partition_generator/nvs_partition_gen.py generate --version 2 --outdir ${CMAKE_BINARY_DIR} "cred.csv" config.bin 0x3000
+                  WORKING_DIRECTORY ${CMAKE_CURRENT_LIST_DIR}/certs/${CONFIG_NAME})
 
 add_dependencies(flash config_bin)
 

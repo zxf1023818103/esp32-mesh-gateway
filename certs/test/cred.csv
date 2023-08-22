@@ -1,8 +1,8 @@
 key,type,encoding,value
 config,namespace,,
-server_cer,file,string,certs/test/server.cer
-client_cer,file,string,certs/test/client.cer
-client_key,file,string,certs/test/client.key
+server_cer,file,string,server.cer
+client_cer,file,string,client.cer
+client_key,file,string,client.key
 product_key,data,string,a1fAL0ry7Sd
 device_name,data,string,jKa5nPhF7ij0QYq3otuw
 device_secret,data,string,32138ef1a43142d6bc0cb2424e6eb39d

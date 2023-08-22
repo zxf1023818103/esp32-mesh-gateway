@@ -110,6 +110,14 @@ struct mqtt_event_handler_args {
     char *gateway_ota_topic;
     char *gateway_ntp_response_topic;
     char *gateway_ota_download_reply_topic;
+    char *gateway_job_update_reply_topic;
+    char *gateway_job_get_reply_topic;
+    char *gateway_job_notify_topic;
+    char *gateway_bootstrap_notify_topic;
+    char *gateway_config_push_topic;
+    char *gateway_config_get_reply_topic;
+    char *gateway_set_onoff_topic;
+    char *gateway_set_hsl_color_topic;
     char *server_cer;
     char *product_key;
     char *device_name;
@@ -432,63 +440,6 @@ static void example_ble_mesh_provisioning_cb(esp_ble_mesh_prov_cb_event_t event,
     }
 }
 
-void example_ble_mesh_send_gen_onoff_set(void)
-{
-    esp_ble_mesh_generic_client_set_state_t set = {0};
-    esp_ble_mesh_client_common_param_t common = {0};
-    esp_err_t err = ESP_OK;
-
-    common.opcode = ESP_BLE_MESH_MODEL_OP_GEN_ONOFF_SET_UNACK;
-    common.model = onoff_client.model;
-    common.ctx.net_idx = store.net_idx;
-    common.ctx.app_idx = store.app_idx;
-    common.ctx.addr = 0xFFFF;   /* to all nodes */
-    common.ctx.send_ttl = 3;
-    common.ctx.send_rel = false;
-    common.msg_timeout = 0;     /* 0 indicates that timeout value from menuconfig will be used */
-    common.msg_role = ROLE_NODE;
-
-    set.onoff_set.op_en = false;
-    set.onoff_set.onoff = store.onoff;
-    set.onoff_set.tid = store.tid++;
-
-    err = esp_ble_mesh_generic_client_set_state(&common, &set);
-    if (err) {
-        ESP_LOGE(BLEMESH_TAG, "Send Generic OnOff Set Unack failed");
-        return;
-    }
-
-    store.onoff = !store.onoff;
-    mesh_example_info_store(); /* Store proper mesh example info */
-}
-
-void example_ble_mesh_send_gen_onoff_get(void)
-{
-    esp_ble_mesh_client_common_param_t common = {0};
-    esp_err_t err = ESP_OK;
-
-    common.opcode = ESP_BLE_MESH_MODEL_OP_GEN_ONOFF_GET;
-    common.model = onoff_client.model;
-    common.ctx.net_idx = store.net_idx;
-    common.ctx.app_idx = store.app_idx;
-    common.ctx.addr = 0x24;   /* to all nodes */
-    common.ctx.send_ttl = 3;
-    common.ctx.send_rel = false;
-    common.msg_timeout = 0;     /* 0 indicates that timeout value from menuconfig will be used */
-    common.msg_role = ROLE_NODE;
-
-    err = esp_ble_mesh_generic_client_get_state(&common, NULL);
-    if (err) {
-        ESP_LOGE(BLEMESH_TAG, "Send Generic OnOff Get failed");
-        return;
-    }
-}
-
-void example_ble_mesh_send_light_hsl_set(void)
-{
-
-}
-
 static void example_ble_mesh_generic_client_cb(esp_ble_mesh_generic_client_cb_event_t event,
                                                esp_ble_mesh_generic_client_cb_param_t *param)
 {
@@ -618,17 +569,17 @@ static esp_err_t ble_mesh_init(void)
 
 static void parse_guider_response(const char *data, int len, nvs_handle_t nvs_handle)
 {
-    cJSON * root_node = cJSON_ParseWithLength(data, (size_t)len);
-    if (root_node) {
-        cJSON * data_node = cJSON_GetObjectItem(root_node, "data");
-        if (data_node) {
-            cJSON * resources_node = cJSON_GetObjectItem(data_node, "resources");
-            if (resources_node) {
-                cJSON * mqtt_node = cJSON_GetObjectItem(resources_node, "mqtt");
-                if (mqtt_node) {
-                    cJSON * host_node = cJSON_GetObjectItem(mqtt_node, "host");
-                    cJSON * port_node = cJSON_GetObjectItem(mqtt_node, "port");
-                    if (host_node && port_node) {
+    cJSON *root_node = cJSON_ParseWithLength(data, (size_t)len);
+    if (cJSON_IsObject(root_node)) {
+        cJSON *data_node = cJSON_GetObjectItem(root_node, "data");
+        if (cJSON_IsObject(data_node)) {
+            cJSON *resources_node = cJSON_GetObjectItem(data_node, "resources");
+            if (cJSON_IsObject(resources_node)) {
+                cJSON *mqtt_node = cJSON_GetObjectItem(resources_node, "mqtt");
+                if (cJSON_IsObject(mqtt_node)) {
+                    cJSON *host_node = cJSON_GetObjectItem(mqtt_node, "host");
+                    cJSON *port_node = cJSON_GetObjectItem(mqtt_node, "port");
+                    if (cJSON_IsString(host_node) && cJSON_IsNumber(port_node)) {
                         const char * host = cJSON_GetStringValue(host_node);
                         uint16_t port = (uint16_t)cJSON_GetNumberValue(port_node);
                         if (host && port) {
@@ -640,9 +591,8 @@ static void parse_guider_response(const char *data, int len, nvs_handle_t nvs_ha
                 }
             }
         }
-
-        cJSON_Delete(root_node);
     }
+    cJSON_Delete(root_node);
 }
 
 static esp_err_t http_event_handler(esp_http_client_event_t *event)
@@ -751,13 +701,13 @@ static void do_time_update(const char *data, int len)
 {
     uint64_t device_recv_time = time(NULL);
 
-    cJSON * root_node = cJSON_ParseWithLength(data, len);
-    if (root_node) {
-        cJSON * device_send_time_node = cJSON_GetObjectItem(root_node, "deviceSendTime");
-        cJSON * server_recv_time_node = cJSON_GetObjectItem(root_node, "serverRecvTime");
-        cJSON * server_send_time_node = cJSON_GetObjectItem(root_node, "serverSendTime");
+    cJSON *root_node = cJSON_ParseWithLength(data, len);
+    if (cJSON_IsObject(root_node)) {
+        cJSON *device_send_time_node = cJSON_GetObjectItem(root_node, "deviceSendTime");
+        cJSON *server_recv_time_node = cJSON_GetObjectItem(root_node, "serverRecvTime");
+        cJSON *server_send_time_node = cJSON_GetObjectItem(root_node, "serverSendTime");
 
-        if (device_send_time_node && server_recv_time_node && server_send_time_node) {
+        if (cJSON_IsNumber(device_send_time_node) && cJSON_IsNumber(server_recv_time_node) && cJSON_IsNumber(server_send_time_node)) {
             uint64_t device_send_time = cJSON_GetNumberValue(device_send_time_node);
             uint64_t server_recv_time = cJSON_GetNumberValue(server_recv_time_node);
             uint64_t server_send_time = cJSON_GetNumberValue(server_send_time_node);
@@ -772,11 +722,16 @@ static void do_time_update(const char *data, int len)
             setenv("TZ", "UTC-8", 1);
             settimeofday(&tv, NULL);
 
-            ESP_LOGI(ALIYUN_TAG, "time updated: %s", esp_log_system_timestamp());
-        }
+            time_t t = time(NULL);
+            struct tm tm;
+            localtime_r(&t, &tm);
 
-        cJSON_Delete(root_node);
+            char datatime[30];
+            size_t datatime_len = strftime(datatime, sizeof datatime, "%F %T UTC%z", &tm);
+            ESP_LOGI(ALIYUN_TAG, "%.*s", datatime_len, datatime);
+        }
     }
+    cJSON_Delete(root_node);
 }
 
 static uint32_t get_next_alink_id() {
@@ -784,11 +739,22 @@ static uint32_t get_next_alink_id() {
     return alink_id++;
 }
 
-static void publish_alink_msg(esp_mqtt_client_handle_t client, const char *topic, cJSON *payload_node, int qos, int retain) {
+static void publish_alink_msg(esp_mqtt_client_handle_t client, const char *topic, cJSON *sys_node, cJSON *params_node, const char *method, int qos, int retain) {
     cJSON *root_node = cJSON_CreateObject();
     cJSON_AddNumberToObject(root_node, "id", get_next_alink_id());
     cJSON_AddStringToObject(root_node, "version", "1.0");
-    cJSON_AddItemToObject(root_node, "params", payload_node);
+    if (sys_node) {
+        cJSON_AddItemToObject(root_node, "sys", sys_node);
+    }
+
+    if (params_node) {
+        cJSON_AddItemToObject(root_node, "params", params_node);
+    }
+
+    if (method) {
+        cJSON_AddStringToObject(root_node, "method", method);
+    }
+
     char *msg = cJSON_PrintUnformatted(root_node);
     cJSON_Delete(root_node);
     while (esp_mqtt_client_publish(client, topic, msg, strlen(msg), qos, retain) < 0);
@@ -796,23 +762,23 @@ static void publish_alink_msg(esp_mqtt_client_handle_t client, const char *topic
 }
 
 static void report_progress(esp_mqtt_client_handle_t client, const char *product_key, const char *device_name, int progress, int qos, int retain) {
-    cJSON *payload_node = cJSON_CreateObject();
-    cJSON_AddStringToObject(payload_node, "desc", "");
-    cJSON_AddNumberToObject(payload_node, "step", progress);
+    cJSON *params_node = cJSON_CreateObject();
+    cJSON_AddStringToObject(params_node, "desc", "");
+    cJSON_AddNumberToObject(params_node, "step", progress);
     char *topic = NULL;
     asprintf(&topic, "/ota/device/progress/%s/%s", product_key, device_name);
     assert(topic);
-    publish_alink_msg(client, topic, payload_node, qos, retain);
+    publish_alink_msg(client, topic, NULL, params_node, NULL, qos, retain);
     free(topic);
 }
 
 static void report_version(esp_mqtt_client_handle_t client, const char *product_key, const char *device_name, const char *version, int qos, int retain) {
-    cJSON *payload_node = cJSON_CreateObject();
-    cJSON_AddStringToObject(payload_node, "version", version);
+    cJSON *params_node = cJSON_CreateObject();
+    cJSON_AddStringToObject(params_node, "version", version);
     char *topic = NULL;
     asprintf(&topic, "/ota/device/inform/%s/%s", product_key, device_name);
     assert(topic);
-    publish_alink_msg(client, topic, payload_node, qos, retain);
+    publish_alink_msg(client, topic, NULL, params_node, NULL, qos, retain);
     free(topic);
 }
 
@@ -841,26 +807,37 @@ static void do_https_ota_upgrade(esp_mqtt_client_handle_t client, const char *pr
 
 static void request_mqtt_download(esp_mqtt_client_handle_t client, const char *product_key, const char *device_name, const char *file_token, uint32_t stream_id, uint32_t file_id, uint32_t size, uint32_t offset, int qos, int retain) {
         
-    cJSON *payload_node = cJSON_CreateObject();
+    cJSON *params_node = cJSON_CreateObject();
     if (file_token) {
-        cJSON_AddStringToObject(payload_node, "fileToken", file_token);
+        cJSON_AddStringToObject(params_node, "fileToken", file_token);
     }
 
     cJSON *file_info_node = cJSON_CreateObject();
     cJSON_AddNumberToObject(file_info_node, "streamId", stream_id);
     cJSON_AddNumberToObject(file_info_node, "fileId", file_id);
-    cJSON_AddItemToObject(payload_node, "fileInfo", file_info_node);
+    cJSON_AddItemToObject(params_node, "fileInfo", file_info_node);
     
     cJSON *file_block_node = cJSON_CreateObject();
     cJSON_AddNumberToObject(file_block_node, "size", size);
     cJSON_AddNumberToObject(file_block_node, "offset", offset);
-    cJSON_AddItemToObject(payload_node, "fileBlock", file_block_node);
+    cJSON_AddItemToObject(params_node, "fileBlock", file_block_node);
 
     char *topic = NULL;
     asprintf(&topic, "/sys/%s/%s/thing/file/download", product_key, device_name);
     assert(topic);
-    publish_alink_msg(client, topic, payload_node, qos, retain);
+    publish_alink_msg(client, topic, NULL, params_node, NULL, qos, retain);
     free(topic);
+}
+
+static void send_alink_response(esp_mqtt_client_handle_t client, const char *topic, int code, int qos, int retain) {
+    cJSON *root_node = cJSON_CreateObject();
+    cJSON_AddNumberToObject(root_node, "id", get_next_alink_id());
+    cJSON_AddNumberToObject(root_node, "code", code);
+    cJSON_AddObjectToObject(root_node, "data");
+    char *msg = cJSON_PrintUnformatted(root_node);
+    cJSON_Delete(root_node);
+    while (esp_mqtt_client_publish(client, topic, msg, strlen(msg), qos, retain) < 0);
+    cJSON_free(msg);
 }
 
 static uint16_t crc_ibm(uint8_t const *buffer, size_t len)
@@ -923,6 +900,121 @@ static int verify_mqtt_file_data(uint8_t *data, uint16_t block_size, uint16_t cr
     return fact_crc16 == crc16;
 }
 
+static uint8_t get_next_tid() {
+    static uint8_t tid;
+    return tid++;
+}
+
+static void process_thing_model_data(struct mqtt_event_handler_args *args, char *data, size_t len) {
+    cJSON *root_node = cJSON_ParseWithLength(data, len);
+    if (cJSON_IsObject(root_node)) {
+        cJSON *method_node = cJSON_GetObjectItem(root_node, "method");
+        if (cJSON_IsString(method_node)) {
+            cJSON *params_node = cJSON_GetObjectItem(root_node, "params");
+            const char *method = cJSON_GetStringValue(method_node);
+            const char service_prefix[] = "thing.service.";
+            if (strncmp(service_prefix, method, sizeof service_prefix - 1) == 0) {
+                const char *service_name = method + sizeof service_prefix - 1;
+                if (strcmp(service_name, "set_onoff") == 0) {
+                    if (cJSON_IsObject(params_node)) {
+                        cJSON *onoff_node = cJSON_GetObjectItem(params_node, "onoff");
+                        cJSON *addr_node = cJSON_GetObjectItem(params_node, "addr");
+                        if (cJSON_IsNumber(onoff_node) && cJSON_IsNumber(addr_node)) {
+                            uint16_t onoff = cJSON_GetNumberValue(onoff_node);
+                            uint16_t addr = cJSON_GetNumberValue(addr_node);
+                            
+                            esp_ble_mesh_client_common_param_t common = {
+                                .opcode = ESP_BLE_MESH_MODEL_OP_GEN_ONOFF_SET_UNACK,
+                                .model = onoff_client.model,
+                                .ctx = {
+                                    .net_idx = store.net_idx,
+                                    .app_idx = store.app_idx,
+                                    .addr = addr,
+                                    .send_rel = false,
+                                },
+                                .msg_timeout = 0,
+                                .msg_role = ROLE_NODE,
+                            };
+
+                            esp_ble_mesh_generic_client_set_state_t set = {
+                                .onoff_set = {
+                                    .op_en = false,
+                                    .onoff = onoff,
+                                    .tid = get_next_tid(),
+                                },
+                            };
+
+                            esp_err_t err = esp_ble_mesh_generic_client_set_state(&common, &set);
+                            if (err) {
+                                ESP_LOGE(BLEMESH_TAG, "Send Generic OnOff Set Unack failed");
+                            }
+                        }
+                    }
+                }
+                else if (strcmp(service_name, "set_hsl_color") == 0) {
+                    if (cJSON_IsObject(params_node)) {
+                        cJSON *hue_node = cJSON_GetObjectItem(params_node, "hue");
+                        cJSON *saturation_node = cJSON_GetObjectItem(params_node, "saturation");
+                        cJSON *lightness_node = cJSON_GetObjectItem(params_node, "lightness");
+                        cJSON *addr_node = cJSON_GetObjectItem(params_node, "addr");
+                        if (cJSON_IsNumber(hue_node) && cJSON_IsNumber(saturation_node) && cJSON_IsNumber(lightness_node) && cJSON_IsNumber(addr_node)) {
+                            uint16_t hue = cJSON_GetNumberValue(hue_node);
+                            uint16_t saturation = cJSON_GetNumberValue(saturation_node);
+                            uint16_t lightness = cJSON_GetNumberValue(lightness_node);
+                            uint16_t addr = cJSON_GetNumberValue(addr_node);
+
+                            esp_ble_mesh_client_common_param_t common = {
+                                .opcode = ESP_BLE_MESH_MODEL_OP_LIGHT_HSL_SET_UNACK,
+                                .model = hsl_client.model,
+                                .ctx = {
+                                    .net_idx = store.net_idx,
+                                    .app_idx = store.app_idx,
+                                    .addr = addr,
+                                    .send_rel = false,
+                                },
+                                .msg_timeout = 0,
+                                .msg_role = ROLE_NODE,
+                            };
+
+                            esp_ble_mesh_light_client_set_state_t set = {
+                                .hsl_set = {
+                                    .op_en = false,
+                                    .hsl_hue = hue,
+                                    .hsl_saturation = saturation,
+                                    .hsl_lightness = lightness,
+                                    .tid = get_next_tid(),
+                                },
+                            };
+
+                            esp_err_t err = esp_ble_mesh_light_client_set_state(&common, &set);
+                            if (err) {
+                                ESP_LOGE(BLEMESH_TAG, "Send Light HSL Set Unack failed");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    cJSON_Delete(root_node);
+}
+
+static void request_config(esp_mqtt_client_handle_t client, const char *product_key, const char *device_name, int qos, int retain) {
+    char *topic = NULL;
+    asprintf(&topic, "/sys/%s/%s/thing/config/get", product_key, device_name);
+    assert(topic);
+
+    cJSON *sys_node = cJSON_CreateObject();
+    cJSON_AddNumberToObject(sys_node, "ack", 1);
+
+    cJSON *params_node = cJSON_CreateObject();
+    cJSON_AddStringToObject(params_node, "configScope", "product");
+    cJSON_AddStringToObject(params_node, "getType", "file");
+
+    publish_alink_msg(client, topic, sys_node, params_node, "thing.config.get", qos, retain);
+    vPortFree(topic);
+}
+
 static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_t event_id, void *event_data)
 {
     struct mqtt_event_handler_args *args = handler_args;
@@ -934,7 +1026,16 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
         case MQTT_EVENT_CONNECTED: {
             ESP_LOGI(ALIYUN_TAG, "MQTT_EVENT_CONNECTED");
             report_version(args->client, args->product_key, args->device_name, esp_app_get_description()->version, 1, 0);
+            while (esp_mqtt_client_subscribe(args->client, args->gateway_ota_topic, 0) < 0);
             while (esp_mqtt_client_subscribe(args->client, args->gateway_ota_download_reply_topic, 0) < 0);
+            while (esp_mqtt_client_subscribe(args->client, args->gateway_job_update_reply_topic, 0) < 0);
+            while (esp_mqtt_client_subscribe(args->client, args->gateway_job_get_reply_topic, 0) < 0);
+            while (esp_mqtt_client_subscribe(args->client, args->gateway_job_notify_topic, 0) < 0);
+            while (esp_mqtt_client_subscribe(args->client, args->gateway_bootstrap_notify_topic, 0) < 0);
+            while (esp_mqtt_client_subscribe(args->client, args->gateway_config_push_topic, 0) < 0);
+            while (esp_mqtt_client_subscribe(args->client, args->gateway_set_onoff_topic, 0) < 0);
+            while (esp_mqtt_client_subscribe(args->client, args->gateway_set_hsl_color_topic, 0) < 0);
+            request_config(args->client, args->product_key, args->device_name, 1, 0);
             break;
         }
         case MQTT_EVENT_DISCONNECTED: {
@@ -959,30 +1060,38 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
                 ESP_LOGI(ALIYUN_TAG ,"%s", "NTP Response Received");
                 do_time_update(event->data, event->data_len);
             }
+            else if (strncmp(args->gateway_set_onoff_topic, event->topic, event->topic_len) == 0) {
+                ESP_LOGI(ALIYUN_TAG, "MQTT_EVENT_DATA, topic=%.*s, msg_id=%d, data=%.*s", event->topic_len, event->topic, event->msg_id, event->data_len, event->data);
+                process_thing_model_data(args, event->data, event->data_len);
+            }
+            else if (strncmp(args->gateway_set_hsl_color_topic, event->topic, event->topic_len) == 0) {
+                ESP_LOGI(ALIYUN_TAG, "MQTT_EVENT_DATA, topic=%.*s, msg_id=%d, data=%.*s", event->topic_len, event->topic, event->msg_id, event->data_len, event->data);
+                process_thing_model_data(args, event->data, event->data_len);
+            }
             else if (strncmp(args->gateway_ota_topic, event->topic, event->topic_len) == 0) {
                 ESP_LOGI(ALIYUN_TAG, "MQTT_EVENT_DATA, topic=%.*s, msg_id=%d, data=%.*s", event->topic_len, event->topic, event->msg_id, event->data_len, event->data);
                 ESP_LOGI(ALIYUN_TAG, "%s", "OTA Request Received");
-                cJSON * root_node = cJSON_ParseWithLength(event->data, event->data_len);
-                if (root_node) {
-                    cJSON * data_node = cJSON_GetObjectItem(root_node, "data");
-                    if (data_node) {
-                        cJSON * version_node = cJSON_GetObjectItem(data_node, "version");
-                        cJSON * url_node = cJSON_GetObjectItem(data_node, "url");
-                        cJSON * size_node = cJSON_GetObjectItem(data_node, "size");
-                        cJSON * stream_id_node = cJSON_GetObjectItem(data_node, "streamId");
-                        cJSON * file_id_node = cJSON_GetObjectItem(data_node, "streamFileId");
-                        if (version_node && size_node) {
+                cJSON *root_node = cJSON_ParseWithLength(event->data, event->data_len);
+                if (cJSON_IsObject(root_node)) {
+                    cJSON *data_node = cJSON_GetObjectItem(root_node, "data");
+                    if (cJSON_IsObject(data_node)) {
+                        cJSON *version_node = cJSON_GetObjectItem(data_node, "version");
+                        cJSON *size_node = cJSON_GetObjectItem(data_node, "size");
+                        if (cJSON_IsString(version_node) && cJSON_IsNumber(size_node)) {
                             const char *version = cJSON_GetStringValue(version_node);
                             size_t size = cJSON_GetNumberValue(size_node);
                             if (strcmp(version, esp_app_get_description()->version) == 0) {
                                 report_version(args->client, args->product_key, args->device_name, version, 1, 0);
                             }
                             else {
-                                if (url_node) {
+                                cJSON *url_node = cJSON_GetObjectItem(data_node, "url");
+                                cJSON *stream_id_node = cJSON_GetObjectItem(data_node, "streamId");
+                                cJSON *file_id_node = cJSON_GetObjectItem(data_node, "streamFileId");
+                                if (cJSON_IsString(url_node)) {
                                     const char *url = cJSON_GetStringValue(url_node);
                                     do_https_ota_upgrade(args->client, args->product_key, args->device_name, url, size);
                                 }
-                                else if (stream_id_node && file_id_node) {
+                                else if (cJSON_IsNumber(stream_id_node) && cJSON_IsNumber(file_id_node)) {
                                     args->last_progress = 0;
                                     args->stream_id = cJSON_GetNumberValue(stream_id_node);
                                     args->file_id = cJSON_GetNumberValue(file_id_node);
@@ -998,9 +1107,8 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
                             }
                         }
                     }
-
-                    cJSON_Delete(root_node);
                 }
+                cJSON_Delete(root_node);
             }
             else if (strncmp(args->gateway_ota_download_reply_topic, event->topic, event->topic_len) == 0) {
                 // ESP_LOGI(ALIYUN_TAG, "MQTT_EVENT_DATA, topic=%.*s, msg_id=%d", event->topic_len, event->topic, event->msg_id);
@@ -1010,21 +1118,21 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
                     json_size |= event->data[1];
                     // ESP_LOGI(ALIYUN_TAG, "%.*s", json_size, event->data + 2);
                     if (json_size + 2 <= event->data_len) {
-                        cJSON * root_node = cJSON_ParseWithLength(event->data + 2, json_size);
-                        if (root_node) {
+                        cJSON *root_node = cJSON_ParseWithLength(event->data + 2, json_size);
+                        if (cJSON_IsObject(root_node)) {
                             cJSON *data_node = cJSON_GetObjectItem(root_node, "data");
-                            if (data_node) {
+                            if (cJSON_IsObject(data_node)) {
                                 cJSON *block_size_node = cJSON_GetObjectItem(data_node, "bSize");
                                 cJSON *block_offset_node = cJSON_GetObjectItem(data_node, "bOffset");
                                 cJSON *file_length_node = cJSON_GetObjectItem(data_node, "fileLength");
                                 cJSON *file_token_node = cJSON_GetObjectItem(data_node, "fileToken");
 
-                                if (file_token_node) {
+                                if (cJSON_IsString(file_token_node)) {
                                     const char *file_token = cJSON_GetStringValue(file_token_node);
                                     ESP_LOGI(ALIYUN_TAG, "file token: %s", file_token);
                                 }
 
-                                if (block_size_node && block_offset_node && file_length_node) {
+                                if (cJSON_IsNumber(block_size_node) && cJSON_IsNumber(block_offset_node) && cJSON_IsNumber(file_length_node)) {
                                     uint32_t block_size = cJSON_GetNumberValue(block_size_node);
                                     uint32_t block_offset = cJSON_GetNumberValue(block_offset_node);
                                     uint32_t file_length = cJSON_GetNumberValue(file_length_node);
@@ -1064,10 +1172,40 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
                                     }
                                 }
                             }
-                            cJSON_Delete(root_node);
                         }
+                        cJSON_Delete(root_node);
                     }
                 }
+            }
+            else if (strncmp(args->gateway_job_notify_topic, event->topic, event->topic_len) == 0) {
+                ESP_LOGI(ALIYUN_TAG, "MQTT_EVENT_DATA, topic=%.*s, msg_id=%d, data=%.*s", event->topic_len, event->topic, event->msg_id, event->data_len, event->data);
+            }
+            else if (strncmp(args->gateway_job_get_reply_topic, event->topic, event->topic_len) == 0) {
+                ESP_LOGI(ALIYUN_TAG, "MQTT_EVENT_DATA, topic=%.*s, msg_id=%d, data=%.*s", event->topic_len, event->topic, event->msg_id, event->data_len, event->data);
+            }
+            else if (strncmp(args->gateway_job_update_reply_topic, event->topic, event->topic_len) == 0) {
+                ESP_LOGI(ALIYUN_TAG, "MQTT_EVENT_DATA, topic=%.*s, msg_id=%d, data=%.*s", event->topic_len, event->topic, event->msg_id, event->data_len, event->data);
+            }
+            else if (strncmp(args->gateway_bootstrap_notify_topic, event->topic, event->topic_len) == 0) {
+                ESP_LOGI(ALIYUN_TAG, "MQTT_EVENT_DATA, topic=%.*s, msg_id=%d, data=%.*s", event->topic_len, event->topic, event->msg_id, event->data_len, event->data);
+                ESP_ERROR_CHECK( nvs_flash_erase_partition("mqtt") );
+                char *topic = NULL;
+                asprintf(&topic, "/sys/%s/%s/thing/bootstrap/notify_reply", args->product_key, args->device_name);
+                assert(topic);
+                send_alink_response(args->client, topic, 200, 1, 0);
+                vPortFree(topic);
+                esp_restart();
+            }
+            else if (strncmp(args->gateway_config_push_topic, event->topic, event->topic_len) == 0) {
+                ESP_LOGI(ALIYUN_TAG, "MQTT_EVENT_DATA, topic=%.*s, msg_id=%d, data=%.*s", event->topic_len, event->topic, event->msg_id, event->data_len, event->data);
+                char *topic = NULL;
+                asprintf(&topic, "/sys/%s/%s/thing/config/push_reply", args->product_key, args->device_name);
+                assert(topic);
+                send_alink_response(args->client, topic, 200, 1, 0);
+                vPortFree(topic);
+            }
+            else if (strncmp(args->gateway_config_get_reply_topic, event->topic, event->topic_len) == 0) {
+                ESP_LOGI(ALIYUN_TAG, "MQTT_EVENT_DATA, topic=%.*s, msg_id=%d, data=%.*s", event->topic_len, event->topic, event->msg_id, event->data_len, event->data);
             }
             break;
         }
@@ -1360,6 +1498,38 @@ void app_main(void)
     asprintf(&args.gateway_ota_download_reply_topic, "/sys/%s/%s/thing/file/download_reply", product_key, device_name);
     assert(args.gateway_ota_download_reply_topic);
     ESP_LOGI(ALIYUN_TAG, "gateway_ota_download_reply_topic: %s", args.gateway_ota_download_reply_topic);
+
+    asprintf(&args.gateway_job_notify_topic, "/sys/%s/%s/thing/job/notify", product_key, device_name);
+    assert(args.gateway_job_notify_topic);
+    ESP_LOGI(ALIYUN_TAG, "gateway_job_notify_topic: %s", args.gateway_job_notify_topic);
+
+    asprintf(&args.gateway_job_update_reply_topic, "/sys/%s/%s/thing/job/update_reply", product_key, device_name);
+    assert(args.gateway_job_update_reply_topic);
+    ESP_LOGI(ALIYUN_TAG, "gateway_job_update_reply_topic: %s", args.gateway_job_update_reply_topic);
+
+    asprintf(&args.gateway_job_get_reply_topic, "/sys/%s/%s/thing/job/get_reply", product_key, device_name);
+    assert(args.gateway_job_get_reply_topic);
+    ESP_LOGI(ALIYUN_TAG, "gateway_job_get_reply_topic: %s", args.gateway_job_get_reply_topic);
+
+    asprintf(&args.gateway_bootstrap_notify_topic, "/sys/%s/%s/thing/bootstrap/notify", product_key, device_name);
+    assert(args.gateway_bootstrap_notify_topic);
+    ESP_LOGI(ALIYUN_TAG, "gateway_bootstrap_notify_topic: %s", args.gateway_bootstrap_notify_topic);
+
+    asprintf(&args.gateway_config_push_topic, "/sys/%s/%s/thing/config/push", product_key, device_name);
+    assert(args.gateway_config_push_topic);
+    ESP_LOGI(ALIYUN_TAG, "gateway_config_push_topic: %s", args.gateway_config_push_topic);
+
+    asprintf(&args.gateway_config_get_reply_topic, "/sys/%s/%s/thing/config/get_reply", product_key, device_name);
+    assert(args.gateway_config_get_reply_topic);
+    ESP_LOGI(ALIYUN_TAG, "gateway_config_get_reply_topic: %s", args.gateway_config_get_reply_topic);
+
+    asprintf(&args.gateway_set_onoff_topic, "/sys/%s/%s/thing/service/set_onoff", product_key, device_name);
+    assert(args.gateway_set_onoff_topic);
+    ESP_LOGI(ALIYUN_TAG, "gateway_set_onoff_topic: %s", args.gateway_set_onoff_topic);
+
+    asprintf(&args.gateway_set_hsl_color_topic, "/sys/%s/%s/thing/service/set_hsl_color", product_key, device_name);
+    assert(args.gateway_set_hsl_color_topic);
+    ESP_LOGI(ALIYUN_TAG, "gateway_set_hsl_color_topic: %s", args.gateway_set_hsl_color_topic);
 
     args.server_cer = server_cer;
     args.product_key = product_key;
