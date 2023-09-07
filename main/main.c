@@ -34,16 +34,18 @@
 #include "esp_ble_mesh_common_api.h"
 #include "esp_ble_mesh_provisioning_api.h"
 #include "esp_ble_mesh_networking_api.h"
+#include "esp_ble_mesh_local_data_operation_api.h"
 #include "esp_ble_mesh_config_model_api.h"
 #include "esp_ble_mesh_generic_model_api.h"
 #include "esp_ble_mesh_lighting_model_api.h"
 
 #include "ble_mesh_example_init.h"
-#include "ble_mesh_example_nvs.h"
 
 #define CONFIG_PARTITION "config"
 
 #define min(x, y) ((x) < (y) ? (x) : (y))
+#define ishex(a) (((a) >= '0' && (a) <= '9') || ((a) >= 'a' && (a) <= 'f'))
+#define tohex(a) (((a) >= '0' && (a) <= '9') ? (a) - '0' : (a) - 'a' + 10)
 
 #define DEF_NVS_STR(key) \
     size_t key##_size = 0; \
@@ -118,6 +120,9 @@ struct mqtt_event_handler_args {
     char *gateway_config_get_reply_topic;
     char *gateway_set_onoff_topic;
     char *gateway_set_hsl_color_topic;
+    char *gateway_property_post_topic;
+    char *gateway_property_set_topic;
+    char *gateway_property_post_reply_topic;
     char *server_cer;
     char *product_key;
     char *device_name;
@@ -139,18 +144,6 @@ struct ota_http_event_handler_args {
     esp_mqtt_client_handle_t client;
 };
 
-static struct example_info_store {
-    uint16_t net_idx;   /* NetKey Index */
-    uint16_t app_idx;   /* AppKey Index */
-    uint8_t  onoff;     /* Remote OnOff */
-    uint8_t  tid;       /* Message TID */
-} __attribute__((packed)) store = {
-    .net_idx = ESP_BLE_MESH_KEY_UNUSED,
-    .app_idx = ESP_BLE_MESH_KEY_UNUSED,
-    .onoff = 0,
-    .tid = 0x0,
-};
-
 static const char *TCPIP_TAG = "tcp/ip";
 static const char *SC_TAG = "smartconfig";
 static const char *ALIYUN_TAG = "aliyun";
@@ -166,9 +159,6 @@ static const int CONNECTED_BIT = BIT0;
 static const int ESPTOUCH_DONE_BIT = BIT1;
 
 static uint8_t dev_uuid[16] = { 0xdd, 0xdd };
-
-static nvs_handle_t NVS_HANDLE;
-static const char * NVS_KEY = "onoff_client";
 
 static esp_ble_mesh_client_t onoff_client;
 static esp_ble_mesh_client_t hsl_client;
@@ -227,24 +217,20 @@ static esp_ble_mesh_prov_t provision = {
 
 static void smartconfig_example_task(void * parm)
 {
-    EventBits_t uxBits;
-    ESP_ERROR_CHECK( esp_smartconfig_set_type(SC_TYPE_ESPTOUCH) );
-    smartconfig_start_config_t cfg = SMARTCONFIG_START_CONFIG_DEFAULT();
-    ESP_ERROR_CHECK( esp_smartconfig_start(&cfg) );
-
-    esp_wifi_connect();
-
-    while (1) {
-        uxBits = xEventGroupWaitBits(s_wifi_event_group, CONNECTED_BIT | ESPTOUCH_DONE_BIT, true, false, portMAX_DELAY);
+    do {
+        EventBits_t uxBits = xEventGroupWaitBits(s_wifi_event_group, CONNECTED_BIT, true, false, portMAX_DELAY);
         if(uxBits & CONNECTED_BIT) {
-            ESP_LOGI(SC_TAG, "WiFi Connected to ap");
-        }
-        if(uxBits & ESPTOUCH_DONE_BIT) {
-            ESP_LOGI(SC_TAG, "smartconfig over");
+            ESP_LOGI(SC_TAG, "Server connected. Stop smartconfig");
             esp_smartconfig_stop();
-            vTaskDelete(NULL);
         }
-    }
+        else {
+            ESP_LOGI(SC_TAG, "Server disconnected. Start smartconfig");
+            ESP_ERROR_CHECK( esp_smartconfig_set_type(SC_TYPE_ESPTOUCH) );
+            smartconfig_start_config_t cfg = SMARTCONFIG_START_CONFIG_DEFAULT();
+            ESP_ERROR_CHECK( esp_smartconfig_start(&cfg) );
+            esp_wifi_connect();
+        }
+    } while (1);
 }
 
 static void event_handler(void* arg, esp_event_base_t event_base,
@@ -254,7 +240,6 @@ static void event_handler(void* arg, esp_event_base_t event_base,
         xTaskCreate(smartconfig_example_task, "smartconfig_example_task", 4096, NULL, 3, NULL);
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_CONNECTED) {
         esp_netif_create_ip6_linklocal(arg);
-        xEventGroupSetBits(s_wifi_event_group, CONNECTED_BIT);
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
         esp_wifi_connect();
         xEventGroupClearBits(s_wifi_event_group, CONNECTED_BIT);
@@ -368,42 +353,10 @@ static void ip_event_handler(void *arg, esp_event_base_t event_base,
     }
 }
 
-static void mesh_example_info_store(void)
-{
-    ble_mesh_nvs_store(NVS_HANDLE, NVS_KEY, &store, sizeof(store));
-}
-
-static void mesh_example_info_restore(void)
-{
-    esp_err_t err = ESP_OK;
-    bool exist = false;
-
-    err = ble_mesh_nvs_restore(NVS_HANDLE, NVS_KEY, &store, sizeof(store), &exist);
-    if (err != ESP_OK) {
-        return;
-    }
-
-    if (exist) {
-        ESP_LOGI(BLEMESH_TAG, "Restore, net_idx 0x%04x, app_idx 0x%04x, onoff %u, tid 0x%02x",
-            store.net_idx, store.app_idx, store.onoff, store.tid);
-    }
-}
-
 static void prov_complete(uint16_t net_idx, uint16_t addr, uint8_t flags, uint32_t iv_index)
 {
     ESP_LOGI(BLEMESH_TAG, "net_idx: 0x%04x, addr: 0x%04x", net_idx, addr);
     ESP_LOGI(BLEMESH_TAG, "flags: 0x%02x, iv_index: 0x%08" PRIx32, flags, iv_index);
-    // board_led_operation(LED_G, LED_OFF);
-    store.net_idx = net_idx;
-    /* mesh_example_info_store() shall not be invoked here, because if the device
-     * is restarted and goes into a provisioned state, then the following events
-     * will come:
-     * 1st: ESP_BLE_MESH_NODE_PROV_COMPLETE_EVT
-     * 2nd: ESP_BLE_MESH_PROV_REGISTER_COMP_EVT
-     * So the store.net_idx will be updated here, and if we store the mesh example
-     * info here, the wrong app_idx (initialized with 0xFFFF) will be stored in nvs
-     * just before restoring it.
-     */
 }
 
 static void example_ble_mesh_provisioning_cb(esp_ble_mesh_prov_cb_event_t event,
@@ -412,7 +365,6 @@ static void example_ble_mesh_provisioning_cb(esp_ble_mesh_prov_cb_event_t event,
     switch (event) {
     case ESP_BLE_MESH_PROV_REGISTER_COMP_EVT:
         ESP_LOGI(BLEMESH_TAG, "ESP_BLE_MESH_PROV_REGISTER_COMP_EVT, err_code %d", param->prov_register_comp.err_code);
-        mesh_example_info_restore(); /* Restore proper mesh example info */
         break;
     case ESP_BLE_MESH_NODE_PROV_ENABLE_COMP_EVT:
         ESP_LOGI(BLEMESH_TAG, "ESP_BLE_MESH_NODE_PROV_ENABLE_COMP_EVT, err_code %d", param->node_prov_enable_comp.err_code);
@@ -488,6 +440,8 @@ static void example_ble_mesh_config_server_cb(esp_ble_mesh_cfg_server_cb_event_t
                 param->value.state_change.appkey_add.net_idx,
                 param->value.state_change.appkey_add.app_idx);
             ESP_LOG_BUFFER_HEX("AppKey", param->value.state_change.appkey_add.app_key, 16);
+            ESP_ERROR_CHECK(esp_ble_mesh_node_bind_app_key_to_local_model(esp_ble_mesh_get_primary_element_address(), BLE_MESH_CID_NVAL, ESP_BLE_MESH_MODEL_ID_GEN_ONOFF_CLI, param->value.state_change.appkey_add.app_idx));
+            ESP_ERROR_CHECK(esp_ble_mesh_node_bind_app_key_to_local_model(esp_ble_mesh_get_primary_element_address(), BLE_MESH_CID_NVAL, ESP_BLE_MESH_MODEL_ID_LIGHT_HSL_CLI, param->value.state_change.appkey_add.app_idx));
             break;
         case ESP_BLE_MESH_MODEL_OP_MODEL_APP_BIND:
             ESP_LOGI(BLEMESH_TAG, "ESP_BLE_MESH_MODEL_OP_MODEL_APP_BIND");
@@ -498,8 +452,6 @@ static void example_ble_mesh_config_server_cb(esp_ble_mesh_cfg_server_cb_event_t
                 param->value.state_change.mod_app_bind.model_id);
             if (param->value.state_change.mod_app_bind.company_id == 0xFFFF &&
                 param->value.state_change.mod_app_bind.model_id == ESP_BLE_MESH_MODEL_ID_GEN_ONOFF_CLI) {
-                store.app_idx = param->value.state_change.mod_app_bind.app_idx;
-                mesh_example_info_store(); /* Store proper mesh example info */
             }
             break;
         default:
@@ -554,15 +506,18 @@ static esp_err_t ble_mesh_init(void)
         return err;
     }
 
-    // err = esp_ble_mesh_node_prov_enable(ESP_BLE_MESH_PROV_ADV | ESP_BLE_MESH_PROV_GATT);
-    // if (err != ESP_OK) {
-    //     ESP_LOGE(BLEMESH_TAG, "Failed to enable mesh node (err %d)", err);
-    //     return err;
-    // }
+    if (!esp_ble_mesh_node_is_provisioned() || !esp_ble_mesh_node_get_local_app_key(0)) {
+        err = esp_ble_mesh_node_prov_enable(ESP_BLE_MESH_PROV_ADV | ESP_BLE_MESH_PROV_GATT);
+        if (err != ESP_OK) {
+            ESP_LOGE(BLEMESH_TAG, "Failed to enable mesh node (err %d)", err);
+            return err;
+        }
+    }
+    else {
+        esp_ble_mesh_node_prov_disable(ESP_BLE_MESH_PROV_ADV | ESP_BLE_MESH_PROV_GATT);
+    }
 
     ESP_LOGI(BLEMESH_TAG, "BLE Mesh Node initialized");
-
-    // board_led_operation(LED_G, LED_ON);
 
     return err;
 }
@@ -927,8 +882,8 @@ static void process_thing_model_data(struct mqtt_event_handler_args *args, char 
                                 .opcode = ESP_BLE_MESH_MODEL_OP_GEN_ONOFF_SET_UNACK,
                                 .model = onoff_client.model,
                                 .ctx = {
-                                    .net_idx = store.net_idx,
-                                    .app_idx = store.app_idx,
+                                    .net_idx = 0,
+                                    .app_idx = 0,
                                     .addr = addr,
                                     .send_rel = false,
                                 },
@@ -967,8 +922,8 @@ static void process_thing_model_data(struct mqtt_event_handler_args *args, char 
                                 .opcode = ESP_BLE_MESH_MODEL_OP_LIGHT_HSL_SET_UNACK,
                                 .model = hsl_client.model,
                                 .ctx = {
-                                    .net_idx = store.net_idx,
-                                    .app_idx = store.app_idx,
+                                    .net_idx = 0,
+                                    .app_idx = 0,
                                     .addr = addr,
                                     .send_rel = false,
                                 },
@@ -992,6 +947,59 @@ static void process_thing_model_data(struct mqtt_event_handler_args *args, char 
                             }
                         }
                     }
+                }
+                else if (strcmp(service_name, "property.set") == 0) {
+                    if (cJSON_IsObject(params_node)) {
+                        cJSON *addr_node = cJSON_GetObjectItem(params_node, "addr");
+                        cJSON *net_key_node = cJSON_GetObjectItem(params_node, "net_key");
+                        cJSON *app_key_node = cJSON_GetObjectItem(params_node, "app_key");
+                        
+                        if (cJSON_IsNumber(addr_node)) {
+                            // uint16_t addr = cJSON_GetNumberValue(addr_node);
+                            // TODO: set node addr
+                        }
+                        else if (cJSON_IsString(net_key_node)) {
+                            const char *net_key_str = cJSON_GetStringValue(net_key_node);
+                            if (strlen(net_key_str) == 32) {
+                                uint8_t net_key[16];
+                                for (int i = 0; i < 16; i++) {
+                                    char a = tolower(net_key_str[2 * i]);
+                                    char b = tolower(net_key_str[2 * i + 1]);
+                                    if (ishex(a) && ishex(b)) {
+                                        uint8_t result = tohex(a) << 4;
+                                        result |= tohex(b);
+                                        net_key[i] = result;
+                                    }
+                                }
+                                esp_err_t err = esp_ble_mesh_node_add_local_net_key(net_key, 0);
+                                if (err) {
+                                    ESP_LOGE(BLEMESH_TAG, "esp_ble_mesh_node_add_local_net_key: %d", err);
+                                }
+                            }
+                        }
+                        else if (cJSON_IsString(app_key_node)) {
+                            const char *app_key_str = cJSON_GetStringValue(app_key_node);
+                            if (strlen(app_key_str) == 32) {
+                                uint8_t app_key[16];
+                                for (int i = 0; i < 16; i++) {
+                                    char a = tolower(app_key_str[2 * i]);
+                                    char b = tolower(app_key_str[2 * i + 1]);
+                                    if (ishex(a) && ishex(b)) {
+                                        uint8_t result = tohex(a) << 4;
+                                        result |= tohex(b);
+                                        app_key[i] = result;
+                                    }
+                                }
+                                esp_err_t err = esp_ble_mesh_node_add_local_app_key(app_key, 0, 0);
+                                if (err) {
+                                    ESP_LOGE(BLEMESH_TAG, "esp_ble_mesh_node_add_local_net_key: %d", err);
+                                }
+                            }
+                        }
+                    }
+                }
+                else if (strcmp(service_name, "reset") == 0) {
+                    esp_ble_mesh_node_local_reset();
                 }
             }
         }
@@ -1025,6 +1033,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
     switch ((esp_mqtt_event_id_t)event_id) {
         case MQTT_EVENT_CONNECTED: {
             ESP_LOGI(ALIYUN_TAG, "MQTT_EVENT_CONNECTED");
+            xEventGroupSetBits(s_wifi_event_group, CONNECTED_BIT);
             report_version(args->client, args->product_key, args->device_name, esp_app_get_description()->version, 1, 0);
             while (esp_mqtt_client_subscribe(args->client, args->gateway_ota_topic, 0) < 0);
             while (esp_mqtt_client_subscribe(args->client, args->gateway_ota_download_reply_topic, 0) < 0);
@@ -1035,11 +1044,14 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
             while (esp_mqtt_client_subscribe(args->client, args->gateway_config_push_topic, 0) < 0);
             while (esp_mqtt_client_subscribe(args->client, args->gateway_set_onoff_topic, 0) < 0);
             while (esp_mqtt_client_subscribe(args->client, args->gateway_set_hsl_color_topic, 0) < 0);
+            while (esp_mqtt_client_subscribe(args->client, args->gateway_property_set_topic, 0) < 0);
+            while (esp_mqtt_client_subscribe(args->client, args->gateway_property_post_reply_topic, 0) < 0);
             request_config(args->client, args->product_key, args->device_name, 1, 0);
             break;
         }
         case MQTT_EVENT_DISCONNECTED: {
             ESP_LOGI(ALIYUN_TAG, "MQTT_EVENT_DISCONNECTED");
+            xEventGroupClearBits(s_wifi_event_group, CONNECTED_BIT);
             break;
         }
         case MQTT_EVENT_SUBSCRIBED: {
@@ -1065,6 +1077,14 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
                 process_thing_model_data(args, event->data, event->data_len);
             }
             else if (strncmp(args->gateway_set_hsl_color_topic, event->topic, event->topic_len) == 0) {
+                ESP_LOGI(ALIYUN_TAG, "MQTT_EVENT_DATA, topic=%.*s, msg_id=%d, data=%.*s", event->topic_len, event->topic, event->msg_id, event->data_len, event->data);
+                process_thing_model_data(args, event->data, event->data_len);
+            }
+            else if (strncmp(args->gateway_property_set_topic, event->topic, event->topic_len) == 0) {
+                ESP_LOGI(ALIYUN_TAG, "MQTT_EVENT_DATA, topic=%.*s, msg_id=%d, data=%.*s", event->topic_len, event->topic, event->msg_id, event->data_len, event->data);
+                process_thing_model_data(args, event->data, event->data_len);
+            }
+            else if (strncmp(args->gateway_property_post_reply_topic, event->topic, event->topic_len) == 0) {
                 ESP_LOGI(ALIYUN_TAG, "MQTT_EVENT_DATA, topic=%.*s, msg_id=%d, data=%.*s", event->topic_len, event->topic, event->msg_id, event->data_len, event->data);
                 process_thing_model_data(args, event->data, event->data_len);
             }
@@ -1445,12 +1465,6 @@ void app_main(void)
         return;
     }
 
-    /* Open nvs namespace for storing/restoring mesh example info */
-    err = ble_mesh_nvs_open(&NVS_HANDLE);
-    if (err) {
-        return;
-    }
-
     ble_mesh_get_dev_uuid(dev_uuid);
 
     /* Initialize the Bluetooth Mesh Subsystem */
@@ -1530,6 +1544,18 @@ void app_main(void)
     asprintf(&args.gateway_set_hsl_color_topic, "/sys/%s/%s/thing/service/set_hsl_color", product_key, device_name);
     assert(args.gateway_set_hsl_color_topic);
     ESP_LOGI(ALIYUN_TAG, "gateway_set_hsl_color_topic: %s", args.gateway_set_hsl_color_topic);
+
+    asprintf(&args.gateway_property_set_topic, "/sys/%s/%s/thing/service/property/set", product_key, device_name);
+    assert(args.gateway_property_set_topic);
+    ESP_LOGI(ALIYUN_TAG, "gateway_property_set_topic: %s", args.gateway_property_set_topic);
+
+    asprintf(&args.gateway_property_post_topic, "/sys/%s/%s/thing/event/property/post", product_key, device_name);
+    assert(args.gateway_property_post_topic);
+    ESP_LOGI(ALIYUN_TAG, "gateway_property_post_topic: %s", args.gateway_property_post_topic);
+
+    asprintf(&args.gateway_property_post_reply_topic, "/sys/%s/%s/thing/event/property/post_reply", product_key, device_name);
+    assert(args.gateway_property_post_reply_topic);
+    ESP_LOGI(ALIYUN_TAG, "gateway_property_post_reply_topic: %s", args.gateway_property_post_reply_topic);
 
     args.server_cer = server_cer;
     args.product_key = product_key;

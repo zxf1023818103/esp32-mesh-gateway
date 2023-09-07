@@ -9,12 +9,16 @@ project(esp32-mesh-gateway)
 
 SET(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Werror=format=0" CACHE STRING "" FORCE)
 
-SET(CONFIG_NAME "test")
+SET(CONFIG_NAME "test2")
 
-add_custom_target(config_bin
-                  COMMAND python $ENV{IDF_PATH}/components/nvs_flash/nvs_partition_generator/nvs_partition_gen.py generate --version 2 --outdir ${CMAKE_BINARY_DIR} "cred.csv" config.bin 0x3000
-                  WORKING_DIRECTORY ${CMAKE_CURRENT_LIST_DIR}/certs/${CONFIG_NAME})
+add_custom_command(OUTPUT config.bin
+                   MAIN_DEPENDENCY "${CMAKE_CURRENT_LIST_DIR}/certs/${CONFIG_NAME}/cred.csv"
+                   DEPENDS "${CMAKE_CURRENT_LIST_DIR}/certs/${CONFIG_NAME}/client.cer" "${CMAKE_CURRENT_LIST_DIR}/certs/${CONFIG_NAME}/client.key" "${CMAKE_CURRENT_LIST_DIR}/certs/${CONFIG_NAME}/server.cer"
+                   COMMAND python $ENV{IDF_PATH}/components/nvs_flash/nvs_partition_generator/nvs_partition_gen.py generate --version 2 --outdir ${CMAKE_BINARY_DIR} "cred.csv" config.bin 0x3000
+                   WORKING_DIRECTORY ${CMAKE_CURRENT_LIST_DIR}/certs/${CONFIG_NAME})
 
-add_dependencies(flash config_bin)
+add_custom_target(config_bin DEPENDS config.bin)
+
+add_dependencies(app config_bin)
 
 esptool_py_flash_to_partition(flash "config" ${CMAKE_BINARY_DIR}/config.bin)
