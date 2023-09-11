@@ -9,7 +9,7 @@ project(esp32-mesh-gateway)
 
 SET(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Werror=format=0" CACHE STRING "" FORCE)
 
-SET(CONFIG_NAME "test2")
+SET(CONFIG_NAME "test")
 
 add_custom_command(OUTPUT config.bin
                    MAIN_DEPENDENCY "${CMAKE_CURRENT_LIST_DIR}/certs/${CONFIG_NAME}/cred.csv"

@@ -217,19 +217,20 @@ static esp_ble_mesh_prov_t provision = {
 
 static void smartconfig_example_task(void * parm)
 {
+    EventBits_t uxBits = 0;
     do {
-        EventBits_t uxBits = xEventGroupWaitBits(s_wifi_event_group, CONNECTED_BIT, true, false, portMAX_DELAY);
         if(uxBits & CONNECTED_BIT) {
             ESP_LOGI(SC_TAG, "Server connected. Stop smartconfig");
             esp_smartconfig_stop();
         }
         else {
             ESP_LOGI(SC_TAG, "Server disconnected. Start smartconfig");
-            ESP_ERROR_CHECK( esp_smartconfig_set_type(SC_TYPE_ESPTOUCH) );
+            ESP_ERROR_CHECK( esp_smartconfig_set_type(SC_TYPE_ESPTOUCH_V2) );
             smartconfig_start_config_t cfg = SMARTCONFIG_START_CONFIG_DEFAULT();
             ESP_ERROR_CHECK( esp_smartconfig_start(&cfg) );
             esp_wifi_connect();
         }
+        uxBits = xEventGroupWaitBits(s_wifi_event_group, CONNECTED_BIT, true, false, portMAX_DELAY);
     } while (1);
 }
 
@@ -476,7 +477,7 @@ static void example_ble_mesh_light_client_cb(esp_ble_mesh_light_client_cb_event_
     case ESP_BLE_MESH_LIGHT_CLIENT_PUBLISH_EVT:
         ESP_LOGI(BLEMESH_TAG, "ESP_BLE_MESH_LIGHT_CLIENT_PUBLISH_EVT");
         if (param->params->opcode == ESP_BLE_MESH_MODEL_OP_LIGHT_HSL_STATUS) {
-            ESP_LOGI(BLEMESH_TAG, "ESP_BLE_MESH_MODEL_OP_LIGHT_HSL_STATUS, hue %0x%04" PRIx16 " saturation %0x%04" PRIx16 " lightness %0x%04" PRIx16, param->status_cb.hsl_status.hsl_hue, param->status_cb.hsl_status.hsl_saturation, param->status_cb.hsl_status.hsl_lightness);
+            ESP_LOGI(BLEMESH_TAG, "ESP_BLE_MESH_MODEL_OP_LIGHT_HSL_STATUS, hue 0x%04" PRIx16 " saturation 0x%04" PRIx16 " lightness 0x%04" PRIx16, param->status_cb.hsl_status.hsl_hue, param->status_cb.hsl_status.hsl_saturation, param->status_cb.hsl_status.hsl_lightness);
         }
         break;
     case ESP_BLE_MESH_LIGHT_CLIENT_TIMEOUT_EVT:
@@ -917,6 +918,8 @@ static void process_thing_model_data(struct mqtt_event_handler_args *args, char 
                             uint16_t saturation = cJSON_GetNumberValue(saturation_node);
                             uint16_t lightness = cJSON_GetNumberValue(lightness_node);
                             uint16_t addr = cJSON_GetNumberValue(addr_node);
+
+                            ESP_LOGI(BLEMESH_TAG, "hue 0x%04" PRIx16 " saturation 0x%04" PRIx16 " lightness 0x%04" PRIx16, hue, saturation, lightness);
 
                             esp_ble_mesh_client_common_param_t common = {
                                 .opcode = ESP_BLE_MESH_MODEL_OP_LIGHT_HSL_SET_UNACK,
